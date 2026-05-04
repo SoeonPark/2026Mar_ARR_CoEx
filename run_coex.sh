@@ -4,16 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-export CUDA_VISIBLE_DEVICES="1"
+export CUDA_VISIBLE_DEVICES="2"
 
 CHECK_ONLY="${CHECK_ONLY:-0}"
 
-if [[ -n "${WANDB_API_KEY:-}" ]]; then
-    wandb online
-    wandb login "$WANDB_API_KEY"
-else
-    export WANDB_MODE=offline
-fi
+# if [[ -n "${WANDB_API_KEY:-}" ]]; then
+#     wandb online
+#     wandb login "$WANDB_API_KEY"
+# else
+#     export WANDB_MODE=offline
+# fi
+wandb offline
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VLLM_DISABLE_FLASHINFER=1
@@ -23,7 +24,6 @@ export CUDA_LAUNCH_BLOCKING=1
 export VLLM_USE_V1=0
 
 MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-auto}"
 
 if [[ $MODEL_PATH == *"DeepSeek-R1-Distill-Qwen-1.5B"* ]]; then
     MODEL_ABB="DeepSeek-R1-Distill-Qwen-1.5B"
@@ -33,7 +33,7 @@ else
     exit 1
 fi
 
-echo "Selected Model: $MODEL_ABB (Util: $GPU_MEM_UTIL, MaxEvalGTok: $MAX_EVAL_GTOK)"
+echo "Selected Model: $MODEL_ABB (MaxEvalGTok: $MAX_EVAL_GTOK)"
 
 loss_type="grpo"
 diversity_reward_type="policy_repulsion_margin"
@@ -47,10 +47,6 @@ learning_rate=1e-4
 max_steps=1000
 use_importance_weighting=False
 policy_repulsion_target="all_other"
-vllm_enable_sleep_mode=True
-trust_remote_code=False
-clear_KV_cache_after_generation=True
-gradient_checkpointing=False
 policy_repulsion_aggregation="max"
 
 num_processes=1
@@ -104,12 +100,7 @@ python -m accelerate.commands.launch --num_processes $num_processes main.py \
     --experiment_name $experiment_name \
     --diversity_reward_type ${diversity_reward_type} \
     --policy_repulsion_target ${policy_repulsion_target} \
-    --vllm_enable_sleep_mode ${vllm_enable_sleep_mode} \
-    --trust_remote_code ${trust_remote_code} \
-    --clear_KV_cache_after_generation ${clear_KV_cache_after_generation} \
-    --gradient_checkpointing ${gradient_checkpointing} \
     --policy_repulsion_aggregation ${policy_repulsion_aggregation} \
-
 
 echo "========== Starting model merge for all checkpoints =========="
 for STEP in "${STEPS[@]}"; do
