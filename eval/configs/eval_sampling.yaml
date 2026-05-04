@@ -1,0 +1,29 @@
+model: vllm
+model_args:
+  # ── 모델 경로 (greedy config와 동일하게 교체) ─────────────────────────────
+  pretrained: <MODEL_PATH>
+
+  dtype: float16
+  max_model_len: 32768
+  max_num_batched_tokens: 32768
+  gpu_memory_utilization: 0.9
+  trust_remote_code: true
+
+tasks:
+  - aime24_passk
+  - aime25_passk
+
+num_fewshot: 0
+batch_size: auto
+
+system_instruction: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
+
+gen_kwargs:
+  temperature: 0.6
+  top_p: 0.95
+  max_gen_toks: 32768
+
+log_samples: true
+
+# ── output_path (실행 전 교체) ────────────────────────────────────────────────
+output_path: ./eval_results/sampling/0_Pretrained/base

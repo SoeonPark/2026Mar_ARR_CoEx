@@ -1,0 +1,42 @@
+model: vllm
+model_args:
+  # ── 모델 경로 (실행 전 아래 중 하나로 교체) ──────────────────────────────
+  # [0_Pretrained]
+  #   <HF_MODEL_PATH>
+  # [1_GRPO]
+  #   ../merged_output/GRPO/checkpoint-XXXX
+  # [2_Proposed]
+  #   ../merged_output/Proposed/checkpoint-XXXX
+  # [3_DRA-GRPO]
+  #   <HF_MODEL_PATH>
+  # ────────────────────────────────────────────────────────────────────────────
+  pretrained: <MODEL_PATH>
+
+  dtype: float16
+  max_model_len: 32768
+  max_num_batched_tokens: 32768
+  gpu_memory_utilization: 0.9
+  trust_remote_code: true
+
+tasks:
+  - minerva_math500
+
+num_fewshot: 0
+batch_size: auto
+
+system_instruction: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
+
+gen_kwargs:
+  temperature: 0
+  top_p: 1
+  max_gen_toks: 32768
+
+log_samples: true
+
+# ── output_path (실행 전 교체) ────────────────────────────────────────────────
+# [0_Pretrained]  ./eval_results/greedy/0_Pretrained/base
+# [1_GRPO]        ./eval_results/greedy/1_GRPO/checkpoint-XXXX
+# [2_Proposed]    ./eval_results/greedy/2_Proposed/checkpoint-XXXX
+# [3_DRA-GRPO]    ./eval_results/greedy/3_DRA-GRPO/base
+# ────────────────────────────────────────────────────────────────────────────
+output_path: ./eval_results/greedy/0_Pretrained/base

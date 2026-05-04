@@ -1,0 +1,87 @@
+# =============================================================================
+# lm-evaluation-harness CLI Config Template
+# Usage: lm_eval --config eval_config.yaml
+# Docs: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/config_files.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Backend (Options: vllm, hf)
+# -----------------------------------------------------------------------------
+model: vllm
+
+model_args:
+  # -- Pretrained model path --
+  # [Pretrained]
+  # Qwen3-1.7B:
+  #   <HF_MODEL_PATH>
+  # DeepSeek-R1-Distill-Qwen-1.5B:
+  #   <HF_MODEL_PATH>
+  # Qwen2.5-Math-1.5B:
+  #   <HF_MODEL_PATH>
+  #
+  # [Fine-tuned checkpoint 예시]
+  #   ../merged_output/<MODEL_NAME>/checkpoint-1000
+  #   ../merged_output/<MODEL_NAME>/checkpoint-900
+  pretrained: <MODEL_PATH>
+  # models--SpiceRL--DRA-GRPO/snapshots/ac317cbb49790f3f6d7ccedd07999015beab0c6f
+
+  dtype: float16
+  max_model_len: 40960          # 40960 | 32768 | 4096
+  max_num_batched_tokens: 40960 # Same as max_model_len
+  gpu_memory_utilization: 0.9
+  trust_remote_code: true
+  # apply_chat_template: true
+
+# -----------------------------------------------------------------------------
+# Tasks
+# -----------------------------------------------------------------------------
+tasks:
+  - aime24
+  - aime25
+  - minerva_math500
+  - gsm8k
+  - mmlu_pro_math
+
+# -----------------------------------------------------------------------------
+# Evaluation Settings
+# -----------------------------------------------------------------------------
+num_fewshot: null      
+batch_size: auto
+
+system_instruction: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
+
+# Generation kwargs
+# gen_kwargs: "temperature=0,top_p=1,max_gen_toks=32768" # 32768 | 2048
+gen_kwargs:
+  temperature: 0
+  top_p: 1
+  max_gen_toks: 40960
+  # until:
+  #   - "</answer>"
+  #   - "<|eot_id|>"
+  #   - "<|im_end|>"
+  #   - "</s>"
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+log_samples: true
+
+# output_path: 모델 타입 / 체크포인트 구분을 위해 아래 패턴 참고
+# [0_Pretrained]  ./eval_results/MMDD/FewShot0/0_Pretrained/base
+# [1_GRPO]        ./eval_results/MMDD/FewShot0/1_GRPO/checkpoint-1000
+# [2_Proposed]    ./eval_results/MMDD/FewShot0/2_Proposed/checkpoint-1000
+output_path: ./eval_results/0224/FewShot0/0_Pretrained/base
+
+# # -----------------------------------------------------------------------------
+# # W&B Logging
+# # -----------------------------------------------------------------------------
+# wandb_args:
+#   project: "2603_arr"
+#   name: "Qwen3-1.7B_pretrained"   
+#   tags:
+#     - Pretrained       # Pretrained | GRPO | Proposed
+#     - Qwen3-1.7B
+#     - aime24
+#     - aime25
+#     - FewShot0

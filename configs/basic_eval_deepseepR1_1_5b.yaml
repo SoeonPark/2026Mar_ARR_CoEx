@@ -1,0 +1,55 @@
+# =============================================================================
+# lm-evaluation-harness CLI Config Template
+# Usage: lm_eval --config eval_config.yaml
+# Docs: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/config_files.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Model Backend (Options: vllm, hf)
+# -----------------------------------------------------------------------------
+model: vllm
+
+model_args:
+  pretrained: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+  dtype: float16
+  max_model_len: 40960          # 40960 | 32768 | 4096
+  max_num_batched_tokens: 40960 # Same as max_model_len
+  gpu_memory_utilization: 0.9
+  trust_remote_code: true
+
+tasks:
+  - aime24
+  - aime25
+  - minerva_math500
+  - gsm8k
+  - mmlu_pro_math
+
+num_fewshot: 0       
+batch_size: auto
+
+# Follows default system instruction for reasoning and answer formatting. You can customize it as needed.
+system_instruction: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
+
+# Generation kwargs
+gen_kwargs: "temperature=0,top_p=1,max_gen_toks=32768" # 32768 | 2048
+
+log_samples: true
+
+# Path name example: ./eval_results/MMDD/FewShot0/0_Pretrained/base
+# [0_Pretrained]  ./eval_results/MMDD/FewShot0/0_Pretrained/base
+# [1_GRPO]        ./eval_results/MMDD/FewShot0/1_GRPO/checkpoint-1000
+# [2_Proposed]    ./eval_results/MMDD/FewShot0/2_Proposed/checkpoint-1000
+output_path: ./eval_results/0224/FewShot0/0_Pretrained/base
+
+# # -----------------------------------------------------------------------------
+# # W&B Logging
+# # -----------------------------------------------------------------------------
+# wandb_args:
+#   project: "2603_arr"
+#   name: "Qwen3-1.7B_pretrained"   
+#   tags:
+#     - Pretrained       # Pretrained | GRPO | Proposed
+#     - Qwen3-1.7B
+#     - aime24
+#     - aime25
+#     - FewShot0
