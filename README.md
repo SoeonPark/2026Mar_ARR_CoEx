@@ -16,6 +16,7 @@ Standard GRPO suffers from homogenized exploration: as the policy converges, sam
 - PyTorch 2.x
 - CUDA 12.x
 - Flash Attention 2
+- conda install -c conda-forge cuda-toolkit=12.2
 
 `pip install -r requirements.txt`
 
