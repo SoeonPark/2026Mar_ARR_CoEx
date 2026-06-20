@@ -278,9 +278,42 @@ class CoExConfig(TrainingArguments):
             "diversity rewards are weighted equally with weight `1.0`."
         },
     )
+    diversity_comparison_scope: str = field(
+        default="intra_adapter",
+        metadata={
+            "help": "Comparison pool for diversity rewards: 'intra_adapter' compares only within the same diversity "
+            "adapter rollout group, excluding the current rollout; 'all_other' compares against all candidates except "
+            "the source adapter's own rollouts."
+        },
+    )
     mini_batch_size: int = field(
         default=None,
         metadata={"help": "Mini-batch size for forward."}
+    )
+    logprob_token_chunk_size: int = field(
+        default=64,
+        metadata={
+            "help": "Number of completion positions projected through the LM head at once when computing logprobs. "
+            "Smaller values reduce peak vocabulary-logit memory."
+        },
+    )
+    logprob_sanity_check: bool = field(
+        default=False,
+        metadata={
+            "help": "Compare PEFT-wrapper and chunked selected logprobs once per active adapter."
+        },
+    )
+    memory_profiling: bool = field(
+        default=True,
+        metadata={"help": "Log CUDA memory at generation, scoring, backward, and optimizer boundaries."},
+    )
+    memory_profile_interval: int = field(
+        default=1,
+        metadata={"help": "Profile CUDA memory every N global steps."},
+    )
+    adapter_sanity_check_steps: int = field(
+        default=10,
+        metadata={"help": "Recheck adapter norms and switch stability every N optimizer steps. Set to 0 to disable."},
     )
 
     # Parameters whose default values are overridden from TrainingArguments
@@ -601,8 +634,8 @@ class CoExConfig(TrainingArguments):
     loss_type: str = field(
         default="grpo",
         metadata={
-            "help": "Specifies the loss formulation to use. Supported values are 'grpo', 'dapo', 'bnpo', and "
-            "'dr_grpo'. "
+            "help": "Specifies the loss formulation to use. Supported values are 'grpo', 'dapo', 'bnpo', "
+            "'dr_grpo', 'dmpo', and 'pure_dmpo'. "
             "'grpo': Aggregates token-level losses by normalizing over sequence length. Not recommended due to length "
             "bias—this approach tends to prefer shorter completions with positive advantages and longer ones with "
             "negative advantages. "
@@ -617,6 +650,35 @@ class CoExConfig(TrainingArguments):
             "`per_device_train_batch_size==1`, the loss is equivalent to the grpo loss."
         },
     )
+    dmpo_base_loss_type: str = field(
+        default="grpo",
+        metadata={"help": "Base policy loss for DMPO: grpo, bnpo, dr_grpo, or dapo."},
+    )
+    dmpo_beta: float = field(
+        default=1.0,
+        metadata={"help": "Weight for the DMPO distribution-matching regularizer."},
+    )
+    dmpo_temperature: float = field(
+        default=1.0 / 15.0,
+        metadata={"help": "Temperature for the reward-induced target distribution in DMPO."},
+    )
+    dmpo_skip_zero_advantage_groups: bool = field(
+        default=False,
+        metadata={"help": "If True, omit uniform-reward groups from the DMPO regularizer."},
+    )
+    dmpo_candidate_scope: str = field(
+        default="main_only",
+        metadata={"help": "Candidate scope for DMPO. main_only is implemented; collective is a placeholder."},
+    )
+    dmpo_log_metrics: bool = field(
+        default=True,
+        metadata={"help": "Log DMPO scalar diagnostics."},
+    )
+    dmpo_sanity_check: bool = field(
+        default=False,
+        metadata={"help": "Print one detailed DMPO sanity-check block on the first valid batch."},
+    )
+
     mask_truncated_completions: bool = field(
         default=False,
         metadata={
@@ -716,11 +778,23 @@ class CoExConfig(TrainingArguments):
         default = 0.5,
         metadata={"help": "Threshold for correctness score to gate diversity reward."}
     )
+    use_importance_weighting: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply importance weighting to main-adapter samples."},
+    )
 
     # Settings for Distribution Repulsion
     diversity_reward_type: str = field(
         default="external",
-        metadata={"help": "external|policy_repulsion_margin|policy_repulsion_margin_barrier"},
+        metadata={"help": "external|one_minus_bleu|one_minus_bleu_score|1-bleu|trace_jaccard|trace_jaccard3|policy_repulsion_margin|policy_repulsion_margin_barrier"},
+    )
+    trace_jaccard_ngram_size: int = field(
+        default=3,
+        metadata={"help": "N-gram size for trace_jaccard rewards. The proposed reward uses 3."},
+    )
+    trace_jaccard_aggregation: str = field(
+        default="max",
+        metadata={"help": "Comparison aggregation for trace_jaccard. Currently only max is supported."},
     )
     policy_repulsion_target: str = field(
         default="all_other",
@@ -771,6 +845,49 @@ class CoExConfig(TrainingArguments):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
         super().__post_init__()
+
+        if self.trace_jaccard_ngram_size <= 0:
+            raise ValueError("trace_jaccard_ngram_size must be positive")
+        if self.trace_jaccard_aggregation != "max":
+            raise ValueError("trace_jaccard_aggregation currently supports only max")
+        if self.logprob_token_chunk_size <= 0:
+            raise ValueError("logprob_token_chunk_size must be positive")
+        if self.memory_profile_interval <= 0:
+            raise ValueError("memory_profile_interval must be positive")
+        if self.adapter_sanity_check_steps < 0:
+            raise ValueError("adapter_sanity_check_steps must be non-negative")
+        if self.diversity_comparison_scope not in {"intra_adapter", "all_other"}:
+            raise ValueError("diversity_comparison_scope must be one of {'intra_adapter', 'all_other'}")
+        valid_diversity_reward_types = {
+            "external",
+            "one_minus_bleu",
+            "one_minus_bleu_score",
+            "1-bleu",
+            "trace_jaccard",
+            "trace_jaccard3",
+            "policy_repulsion_margin",
+            "policy_repulsion_margin_barrier",
+        }
+        if self.diversity_reward_type not in valid_diversity_reward_types:
+            raise ValueError(
+                "diversity_reward_type must be one of "
+                f"{sorted(valid_diversity_reward_types)}, got {self.diversity_reward_type!r}"
+            )
+        valid_loss_types = {"grpo", "bnpo", "dr_grpo", "dapo", "dmpo", "pure_dmpo"}
+        if self.loss_type not in valid_loss_types:
+            raise ValueError(f"loss_type must be one of {sorted(valid_loss_types)}, got {self.loss_type!r}")
+        valid_dmpo_base_loss_types = {"grpo", "bnpo", "dr_grpo", "dapo"}
+        if self.dmpo_base_loss_type not in valid_dmpo_base_loss_types:
+            raise ValueError(
+                "dmpo_base_loss_type must be one of "
+                f"{sorted(valid_dmpo_base_loss_types)}, got {self.dmpo_base_loss_type!r}"
+            )
+        if self.dmpo_temperature <= 0:
+            raise ValueError("dmpo_temperature must be positive")
+        if self.dmpo_beta < 0:
+            raise ValueError("dmpo_beta must be non-negative")
+        if self.dmpo_candidate_scope not in {"main_only", "collective"}:
+            raise ValueError("dmpo_candidate_scope must be one of {'main_only', 'collective'}")
 
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
 
@@ -826,6 +943,9 @@ class CoExConfig(TrainingArguments):
                 stacklevel=2,
             )
             self.use_liger_kernel = self.use_liger_loss
+
+        if self.loss_type in {"dmpo", "pure_dmpo"} and self.use_liger_kernel:
+            raise NotImplementedError("DMPO is not implemented for the Liger fused loss path.")
 
         if self.delta is not None and self.use_liger_kernel:
             raise ValueError("Liger kernel does not support two-sided CoEx loss yet.")
