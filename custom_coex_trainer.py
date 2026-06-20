@@ -36,6 +36,7 @@ from datasets import Dataset, IterableDataset
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
+from torch.utils.checkpoint import checkpoint
 import torch.distributed as dist
 
 from transformers import (
@@ -68,6 +69,7 @@ from trl.models.utils import _ForwardRedirection
 from trl.trainer.base_trainer import BaseTrainer
 from trl.trainer.callbacks import SyncRefModelCallback
 from custom_coex_config import CoExConfig
+from rewards.diversity import trace_jaccard_diversity_reward
 from trl.trainer.utils import (
     RepeatSampler,
     disable_dropout_in_model,
@@ -249,6 +251,12 @@ class CoExTrainer(BaseTrainer):
 
     _tag_names = ["trl", "coex"]
     _name = "CoEx"
+    _POLICY_REPULSION_REWARD_TYPES = {
+        "policy_repulsion_margin",
+        "policy_repulsion_margin_barrier",
+    }
+    _TRACE_JACCARD_REWARD_TYPES = {"trace_jaccard", "trace_jaccard3"}
+    _ONE_MINUS_BLEU_REWARD_TYPES = {"one_minus_bleu", "one_minus_bleu_score", "1-bleu"}
     _paper = {
         "title": "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
         "id": "2402.03300",
@@ -494,6 +502,14 @@ class CoExTrainer(BaseTrainer):
         self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
+        self.dmpo_base_loss_type = args.dmpo_base_loss_type
+        self.dmpo_beta = args.dmpo_beta
+        self.dmpo_temperature = args.dmpo_temperature
+        self.dmpo_skip_zero_advantage_groups = args.dmpo_skip_zero_advantage_groups
+        self.dmpo_candidate_scope = args.dmpo_candidate_scope
+        self.dmpo_log_metrics = args.dmpo_log_metrics
+        self.dmpo_sanity_check = args.dmpo_sanity_check
+        self._dmpo_sanity_printed = False
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
@@ -503,6 +519,7 @@ class CoExTrainer(BaseTrainer):
 
         self.diversity_reward_type = args.diversity_reward_type
         self.policy_repulsion_target = args.policy_repulsion_target
+        self.diversity_comparison_scope = args.diversity_comparison_scope
         self.policy_repulsion_batch_size = args.policy_repulsion_batch_size
         self.policy_repulsion_gate_by_correctness = args.policy_repulsion_gate_by_correctness
         self.policy_repulsion_gate_threshold = args.policy_repulsion_gate_threshold
@@ -1113,7 +1130,9 @@ class CoExTrainer(BaseTrainer):
                 self.enable_all_lora_grads(self.model)
                 adapter_inputs["_adapter_name"] = adapter_name
 
-                if self.loss_type == "dapo":
+                if self.loss_type == "dapo" or (
+                    self.loss_type == "dmpo" and self.dmpo_base_loss_type == "dapo"
+                ):
                     # Local Completion tokens on this rank
                     local_token = adapter_inputs["completion_mask"].sum().to(torch.float32)
 
@@ -1134,6 +1153,17 @@ class CoExTrainer(BaseTrainer):
                     if isinstance(t, torch.Tensor) and t.ndim >= 1),
                     None,
                 )
+
+                if (
+                    self.loss_type in {"dmpo", "pure_dmpo"}
+                    and current_batch_size is not None
+                    and self.args.mini_batch_size is not None
+                    and current_batch_size > self.args.mini_batch_size
+                ):
+                    raise ValueError(
+                        "DMPO requires each prompt rollout group to stay in one loss call. "
+                        "Disable mini-batch splitting or set mini_batch_size >= the adapter batch size."
+                    )
 
                 # --- mini-batch split 경로 ---
                 if (
@@ -1268,6 +1298,292 @@ class CoExTrainer(BaseTrainer):
         entropy_mask = masked_entropies >= entropy_threshold
         return entropy_mask & mask.bool()  # ensure padding tokens are always masked out
 
+    def _get_unwrapped_policy_model(self, model):
+        return self.accelerator.unwrap_model(model)
+
+    def _get_unwrapped_causal_lm(self, model):
+        unwrapped_model = self._get_unwrapped_policy_model(model)
+        if is_peft_model(unwrapped_model):
+            # This is the same LoRA-injected CausalLM, not an adapter-free copy.
+            return unwrapped_model.get_base_model()
+        return unwrapped_model
+
+    @staticmethod
+    def _active_adapter_name(model) -> str:
+        active_adapter = getattr(model, "active_adapter", None)
+        if active_adapter is None:
+            active_adapter = getattr(model, "active_adapters", None)
+        if isinstance(active_adapter, (list, tuple)):
+            return ",".join(str(name) for name in active_adapter)
+        return str(active_adapter)
+
+    @staticmethod
+    def _match_lm_head_dtype(lm_head, hidden_states):
+        lm_head_weight = getattr(lm_head, "weight", None)
+        if (
+            lm_head_weight is not None
+            and hidden_states.dtype != lm_head_weight.dtype
+        ):
+            hidden_states = hidden_states.to(lm_head_weight.dtype)
+        return hidden_states
+
+    def _project_selected_logps_chunk(
+        self,
+        lm_head,
+        hidden_states,
+        target_ids,
+    ):
+        hidden_states = self._match_lm_head_dtype(
+            lm_head,
+            hidden_states,
+        )
+        logits = lm_head(hidden_states)
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            # Match Accelerate's output conversion for one token chunk only.
+            logits = logits.float()
+        logits = logits / self.temperature
+        selected_logps = selective_log_softmax(logits, target_ids)
+        del logits
+        return selected_logps
+
+    def _chunked_selected_logps_from_hidden_states(
+        self,
+        lm_head,
+        hidden_states,
+        target_ids,
+        compute_entropy=False,
+        chunk_size=None,
+        use_checkpoint=True,
+    ):
+        chunk_size = chunk_size or self.args.logprob_token_chunk_size
+        if chunk_size <= 0:
+            raise ValueError("logprob_token_chunk_size must be positive")
+        if hidden_states.shape[:2] != target_ids.shape:
+            raise ValueError(
+                "Hidden-state and target-token shapes differ: "
+                f"{tuple(hidden_states.shape)} vs {tuple(target_ids.shape)}"
+            )
+
+        logps_chunks = []
+        entropy_chunks = []
+        keep_graph = torch.is_grad_enabled() and hidden_states.requires_grad
+
+        def project_chunk(hidden_chunk, target_chunk):
+            return self._project_selected_logps_chunk(
+                lm_head,
+                hidden_chunk,
+                target_chunk,
+            )
+
+        for token_start in range(0, hidden_states.size(1), chunk_size):
+            token_end = min(token_start + chunk_size, hidden_states.size(1))
+            hidden_chunk = hidden_states[:, token_start:token_end, :]
+            target_chunk = target_ids[:, token_start:token_end]
+
+            if keep_graph and use_checkpoint:
+                # Checkpointing prevents autograd from retaining every
+                # [B, chunk_T, V] softmax intermediate until backward.
+                logps_chunk = checkpoint(
+                    project_chunk,
+                    hidden_chunk,
+                    target_chunk,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+
+                if compute_entropy:
+                    # Entropy is metric/masking data and does not need a graph.
+                    with torch.no_grad():
+                        entropy_hidden = self._match_lm_head_dtype(
+                            lm_head,
+                            hidden_chunk.detach(),
+                        )
+                        entropy_logits = lm_head(entropy_hidden)
+                        if entropy_logits.dtype in (
+                            torch.float16,
+                            torch.bfloat16,
+                        ):
+                            entropy_logits = entropy_logits.float()
+                        entropy_logits = entropy_logits / self.temperature
+                        entropy_chunks.append(
+                            entropy_from_logits(entropy_logits)
+                        )
+                        del entropy_logits
+                        del entropy_hidden
+            else:
+                # Old/ref/reward-only callers reach this branch under no_grad.
+                projection_hidden = self._match_lm_head_dtype(
+                    lm_head,
+                    hidden_chunk,
+                )
+                logits_chunk = lm_head(projection_hidden)
+                if logits_chunk.dtype in (torch.float16, torch.bfloat16):
+                    logits_chunk = logits_chunk.float()
+                logits_chunk = logits_chunk / self.temperature
+                logps_chunk = selective_log_softmax(
+                    logits_chunk,
+                    target_chunk,
+                )
+                if compute_entropy:
+                    entropy_chunks.append(entropy_from_logits(logits_chunk))
+                del logits_chunk
+                del projection_hidden
+
+            logps_chunks.append(logps_chunk)
+
+        per_token_logps = torch.cat(logps_chunks, dim=1)
+        entropies = (
+            torch.cat(entropy_chunks, dim=1)
+            if compute_entropy
+            else None
+        )
+        return per_token_logps, entropies
+
+    @torch.no_grad()
+    def _maybe_run_chunked_logprob_sanity_check(
+        self,
+        policy_model,
+        model_inputs,
+        target_ids,
+    ):
+        enabled = self.args.logprob_sanity_check or os.environ.get(
+            "COEX_LOGPROB_SANITY_CHECK",
+            "0",
+        ).lower() in {"1", "true", "yes"}
+        if not enabled:
+            return
+
+        unwrapped_peft_model = self._get_unwrapped_policy_model(policy_model)
+        if not is_peft_model(unwrapped_peft_model):
+            return
+        if "logits_to_keep" not in self.model_kwarg_keys:
+            raise RuntimeError(
+                "PEFT logprob sanity check requires logits_to_keep support."
+            )
+
+        active_adapter = self._active_adapter_name(unwrapped_peft_model)
+        checked_adapters = getattr(
+            self,
+            "_chunked_logprob_sanity_checked_adapters",
+            set(),
+        )
+        if active_adapter in checked_adapters:
+            return
+
+        debug_tokens = min(
+            int(os.environ.get("COEX_LOGPROB_SANITY_MAX_TOKENS", "16")),
+            target_ids.size(1),
+        )
+        if debug_tokens <= 0:
+            return
+
+        causal_lm = unwrapped_peft_model.get_base_model()
+        base_active_adapter = self._active_adapter_name(
+            getattr(unwrapped_peft_model, "base_model", causal_lm)
+        )
+        if base_active_adapter != active_adapter:
+            raise RuntimeError(
+                "PEFT active-adapter mismatch: "
+                f"wrapper={active_adapter}, base={base_active_adapter}"
+            )
+
+        lm_head = causal_lm.get_output_embeddings()
+        if lm_head is None:
+            raise RuntimeError("PEFT policy has no output LM head")
+
+        input_batch_size = model_inputs["input_ids"].size(0)
+        sanity_model_inputs = {}
+        for key, value in model_inputs.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.size(0) == input_batch_size
+            ):
+                sanity_model_inputs[key] = value[:1]
+            else:
+                sanity_model_inputs[key] = value
+        sanity_model_inputs.pop("logits_to_keep", None)
+        sanity_model_inputs["use_cache"] = False
+        sample_targets = target_ids[:1, -debug_tokens:]
+
+        was_training = unwrapped_peft_model.training
+        unwrapped_peft_model.eval()
+        try:
+            with self.compute_loss_context_manager():
+                # Reference path: the original PEFT wrapper forward.
+                full_outputs = unwrapped_peft_model(
+                    **sanity_model_inputs,
+                    logits_to_keep=debug_tokens + 1,
+                )
+                full_logits = full_outputs.logits[:, :-1, :]
+                full_logits = full_logits[:, -debug_tokens:, :]
+                if full_logits.dtype in (torch.float16, torch.bfloat16):
+                    full_logits = full_logits.float()
+                full_logits = full_logits / self.temperature
+                full_shape = tuple(full_logits.shape)
+                full_logps = selective_log_softmax(
+                    full_logits,
+                    sample_targets,
+                )
+
+                # Candidate path: the same LoRA-injected backbone and head.
+                direct_hidden_states = causal_lm.model(
+                    **sanity_model_inputs
+                ).last_hidden_state
+                direct_hidden_states = direct_hidden_states[:, :-1, :]
+                direct_hidden_states = direct_hidden_states[
+                    :,
+                    -debug_tokens:,
+                    :,
+                ]
+                debug_chunk_size = max(
+                    1,
+                    min(
+                        self.args.logprob_token_chunk_size,
+                        max(1, debug_tokens // 2),
+                    ),
+                )
+                chunked_logps, _ = (
+                    self._chunked_selected_logps_from_hidden_states(
+                        lm_head,
+                        direct_hidden_states,
+                        sample_targets,
+                        compute_entropy=False,
+                        chunk_size=debug_chunk_size,
+                        use_checkpoint=False,
+                    )
+                )
+        finally:
+            unwrapped_peft_model.train(was_training)
+
+        absolute_difference = (full_logps - chunked_logps).abs()
+        max_abs_diff = absolute_difference.max().item()
+        mean_abs_diff = absolute_difference.mean().item()
+        print(
+            "[LOGPROB_SANITY] "
+            f"active_adapter={active_adapter} "
+            f"full_logits_shape={full_shape} "
+            f"chunk_size={debug_chunk_size} "
+            f"max_abs_diff={max_abs_diff:.8e} "
+            f"mean_abs_diff={mean_abs_diff:.8e}"
+        )
+
+        checked_adapters.add(active_adapter)
+        self._chunked_logprob_sanity_checked_adapters = checked_adapters
+
+        del full_outputs
+        del full_logits
+        del full_logps
+        del direct_hidden_states
+        del chunked_logps
+        del absolute_difference
+
+        if max_abs_diff > 1e-2:
+            raise RuntimeError(
+                "Chunked logprob sanity check failed for active adapter "
+                f"{active_adapter}: max_abs_diff={max_abs_diff:.8e}"
+            )
+
     @profiling_decorator
     def _get_per_token_logps_and_entropies(
         self,
@@ -1284,63 +1600,117 @@ class CoExTrainer(BaseTrainer):
         image_sizes=None,
         token_type_ids=None,
     ) -> dict[str, torch.Tensor | None]:
-        """Compute log-probs and (optionally) entropies for each token."""
-        # breakpoint()
-        batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
-        # breakpoint()
+        """Compute selected token log-probs without full [B, T, V] logits."""
+        batch_size = batch_size or input_ids.size(0)
         all_logps = []
         all_entropies = []
-        for start in range(0, input_ids.size(0), batch_size):
-            input_ids_batch = input_ids[start : start + batch_size]
-            attention_mask_batch = attention_mask[start : start + batch_size]
 
-            # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
-            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
+        causal_lm = self._get_unwrapped_causal_lm(model)
+        lm_head = causal_lm.get_output_embeddings()
+        if lm_head is None:
+            raise RuntimeError("Model does not expose an output LM head")
+        if not hasattr(causal_lm, "model"):
+            raise RuntimeError(
+                "Chunked logprob computation requires a `.model` backbone"
+            )
+
+        run_sanity_check = torch.is_grad_enabled()
+        for start in range(0, input_ids.size(0), batch_size):
+            end = min(start + batch_size, input_ids.size(0))
+            input_ids_batch = input_ids[start:end]
+            attention_mask_batch = attention_mask[start:end]
+
+            model_inputs = {
+                "input_ids": input_ids_batch,
+                "attention_mask": attention_mask_batch,
+                "use_cache": False,
+            }
             if image_grid_thw is not None and pixel_values is not None:
                 rows_per_image = image_grid_thw.prod(dim=-1)
                 rows_per_sample = torch.split(rows_per_image, num_images)
-                rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
-                cum_rows = torch.cat([torch.tensor([0], device=rows_per_sample.device), rows_per_sample.cumsum(0)])
-                row_start, row_end = cum_rows[start].item(), cum_rows[start + batch_size].item()
+                rows_per_sample = torch.stack(
+                    [sample_rows.sum() for sample_rows in rows_per_sample]
+                )
+                cum_rows = torch.cat(
+                    [
+                        torch.tensor([0], device=rows_per_sample.device),
+                        rows_per_sample.cumsum(0),
+                    ]
+                )
+                row_start, row_end = (
+                    cum_rows[start].item(),
+                    cum_rows[end].item(),
+                )
                 model_inputs["pixel_values"] = pixel_values[row_start:row_end]
-                cum_imgs = torch.tensor([0] + num_images).cumsum(0)
-                img_start, img_end = cum_imgs[start], cum_imgs[start + batch_size]
-                model_inputs["image_grid_thw"] = image_grid_thw[img_start:img_end]
+                cum_imgs = torch.tensor(
+                    [0] + list(num_images),
+                    device=image_grid_thw.device,
+                ).cumsum(0)
+                img_start, img_end = (
+                    cum_imgs[start].item(),
+                    cum_imgs[end].item(),
+                )
+                model_inputs["image_grid_thw"] = image_grid_thw[
+                    img_start:img_end
+                ]
             elif pixel_values is not None:
-                model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
+                model_inputs["pixel_values"] = pixel_values[start:end]
             if pixel_attention_mask is not None:
-                model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
+                model_inputs["pixel_attention_mask"] = pixel_attention_mask[
+                    start:end
+                ]
             if image_sizes is not None:
-                model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
+                model_inputs["image_sizes"] = image_sizes[start:end]
             if token_type_ids is not None:
-                model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
+                model_inputs["token_type_ids"] = token_type_ids[start:end]
 
-            # Only add logits_to_keep if the model supports it
-            if "logits_to_keep" in self.model_kwarg_keys:
-                # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-                model_inputs["logits_to_keep"] = logits_to_keep + 1
+            with self.compute_loss_context_manager():
+                # get_base_model() retains the injected LoRA modules and the
+                # adapter selected by PeftModel.set_adapter().
+                hidden_states = causal_lm.model(
+                    **model_inputs
+                ).last_hidden_state
+                hidden_states = hidden_states[:, :-1, :]
+                hidden_states = hidden_states[:, -logits_to_keep:, :]
+                completion_ids = input_ids_batch[:, -logits_to_keep:]
 
-            model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
+                if torch.is_grad_enabled() and not hidden_states.requires_grad:
+                    raise RuntimeError(
+                        "Current-policy hidden states do not require gradients"
+                    )
 
-            logits = model(**model_inputs).logits
-            # Exclude the last value: it corresponds to the next token pred
-            logits = logits[:, :-1, :]  # (B, L-1, H)
-            # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
-            logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits = logits / self.temperature
-            completion_ids = input_ids_batch[:, -logits_to_keep:]
-            logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
+                logps, entropies = (
+                    self._chunked_selected_logps_from_hidden_states(
+                        lm_head,
+                        hidden_states,
+                        completion_ids,
+                        compute_entropy=compute_entropy,
+                    )
+                )
+
+            if run_sanity_check:
+                self._maybe_run_chunked_logprob_sanity_check(
+                    model,
+                    model_inputs,
+                    completion_ids,
+                )
+
+            if logps.shape != completion_ids.shape:
+                raise RuntimeError(
+                    "Chunked selected-logprob shape mismatch: "
+                    f"{tuple(logps.shape)} vs {tuple(completion_ids.shape)}"
+                )
+
             all_logps.append(logps)
-
             if compute_entropy:
-                with torch.no_grad():
-                    entropies = entropy_from_logits(logits)
                 all_entropies.append(entropies)
 
         logps = torch.cat(all_logps, dim=0)
-        entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        entropies = (
+            torch.cat(all_entropies, dim=0)
+            if compute_entropy
+            else None
+        )
         return logps, entropies
 
     def _fix_param_name_to_vllm(self, name, extra_prefixes: list[str] | None = None):
@@ -1654,12 +2024,40 @@ class CoExTrainer(BaseTrainer):
                                 generation_batch_per_adapter[adapter_name]["correctness_advantages"]
                             )
                         else:
-                            # diversity reward 계산
-                            other_data = {}
-                            for key in ["completions", "completion_ids_list"]:
-                                other_data[key] = pass_data_per_adapter["default"][key].copy()
-                                for my_data in pass_data_per_adapter[adapter_name][key]:
-                                    other_data[key].remove(my_data)
+                            # diversity reward comparison pool.
+                            # Default: compare only within this diversity adapter's rollout group,
+                            # excluding the current rollout inside the reward function.
+                            all_pass_data = pass_data_per_adapter["default"]
+                            source_indices = list(adapter_to_indices[adapter_name])
+                            source_index_set = set(source_indices)
+                            if self.diversity_comparison_scope == "intra_adapter":
+                                comparison_indices = source_indices
+                            elif self.diversity_comparison_scope == "all_other":
+                                comparison_indices = [
+                                    index
+                                    for index in range(len(all_pass_data["completions"]))
+                                    if index not in source_index_set
+                                ]
+                            else:
+                                raise ValueError(
+                                    f"Unknown diversity_comparison_scope: {self.diversity_comparison_scope}"
+                                )
+                            index_to_adapter = {}
+                            for rollout_adapter, rollout_indices in adapter_to_indices.items():
+                                for index in rollout_indices:
+                                    index_to_adapter[index] = rollout_adapter
+
+                            other_data = {
+                                key: [all_pass_data[key][index] for index in comparison_indices]
+                                for key in ["prompts", "completions", "completion_ids_list"]
+                            }
+                            other_data["adapter_names"] = [
+                                index_to_adapter[index] for index in comparison_indices
+                            ]
+                            other_data["candidate_indices"] = source_indices
+                            other_data["comparison_indices"] = comparison_indices
+                            other_data["exclude_self"] = self.diversity_comparison_scope == "intra_adapter"
+                            other_data["comparison_scope"] = self.diversity_comparison_scope
                             
                             generation_batch_per_adapter[adapter_name] = self._score_completions_diversity(
                                 generation_batch_per_adapter[adapter_name], 
@@ -1852,7 +2250,8 @@ class CoExTrainer(BaseTrainer):
 
                 for adapter_name in self.all_adapter_names:
                     generation_batch_per_adapter[adapter_name] = split_pixel_values_by_grid(generation_batch_per_adapter[adapter_name])
-                    generation_batch_per_adapter[adapter_name] = shuffle_sequence_dict(generation_batch_per_adapter[adapter_name])
+                    if self.loss_type not in {"dmpo", "pure_dmpo"}:
+                        generation_batch_per_adapter[adapter_name] = shuffle_sequence_dict(generation_batch_per_adapter[adapter_name])
                     
                 # generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                 # self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
@@ -3558,6 +3957,7 @@ class CoExTrainer(BaseTrainer):
             "correctness_advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
             "correctness_reward_per_sample": local_rewards,
+            "raw_rewards": local_rewards,
             "answer_info": local_answer_info,
         }
         if old_per_token_logps is not None:
@@ -3596,10 +3996,11 @@ class CoExTrainer(BaseTrainer):
         completions = pass_data["completions"]
         completion_ids_list = pass_data["completion_ids_list"]
 
-        use_policy_repulsion = getattr(self.args, "diversity_reward_type", "external") in {
-            "policy_repulsion_margin",
-            "policy_repulsion_margin_barrier",
-        }
+        reward_type = getattr(self.args, "diversity_reward_type", "external")
+        # External reward types use self.diversity_reward_funcs. Trainer-native
+        # policy-repulsion and trace-Jaccard rewards are handled below.
+        use_policy_repulsion = reward_type in self._POLICY_REPULSION_REWARD_TYPES
+        trace_diagnostics = None
 
         if use_policy_repulsion:
             # 1) local repulsion rewards
@@ -3647,8 +4048,38 @@ class CoExTrainer(BaseTrainer):
                     gate_g = gather(gate)
                     self._metrics[mode][f"{adapter_name}/repulsion/gate_frac"].append(gate_g.mean().item())
 
-        else:
-            # external diversity reward
+        elif reward_type in self._TRACE_JACCARD_REWARD_TYPES:
+            local_reward_values, local_diagnostics = trace_jaccard_diversity_reward(
+                prompts=prompts,
+                completions=completions,
+                other_prompts=other_data["prompts"],
+                other_completions=other_data["completions"],
+                source_adapter=adapter_name,
+                comparison_adapters=other_data.get("adapter_names"),
+                candidate_ids=other_data.get("candidate_indices"),
+                other_candidate_ids=other_data.get("comparison_indices"),
+                exclude_self=bool(other_data.get("exclude_self", False)),
+                ngram_size=int(getattr(self.args, "trace_jaccard_ngram_size", 3)),
+                return_diagnostics=True,
+            )
+            local_rewards = torch.tensor(
+                local_reward_values, dtype=torch.float32, device=device
+            )
+            local_rewards = torch.nan_to_num(
+                local_rewards, nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp_(0.0, 1.0)
+            rewards_per_func = gather(local_rewards).unsqueeze(1)
+            diversity_reward_names = [reward_type]
+            diversity_weights = torch.ones(1, device=device)
+            trace_diagnostics = {
+                name: gather(
+                    torch.tensor(values, dtype=torch.float32, device=device)
+                )
+                for name, values in local_diagnostics.items()
+            }
+            trace_diagnostics["reward"] = rewards_per_func[:, 0]
+
+        elif reward_type == "external" or reward_type in self._ONE_MINUS_BLEU_REWARD_TYPES:
             rewards_per_func = self._calculate_diversity_rewards(
                 inputs,
                 prompts,
@@ -3659,6 +4090,9 @@ class CoExTrainer(BaseTrainer):
             )  # already gathered
             diversity_reward_names = self.diversity_reward_func_names
             diversity_weights = self.diversity_reward_weights.to(device)
+
+        else:
+            raise ValueError(f"Unknown diversity_reward_type: {reward_type}")
 
         rewards = (rewards_per_func * diversity_weights.unsqueeze(0)).nansum(dim=1)
 
@@ -3674,9 +4108,15 @@ class CoExTrainer(BaseTrainer):
         else:
             raise ValueError(f"Invalid scale_rewards: {self.scale_rewards}")
 
+        std_rewards = torch.nan_to_num(
+            std_rewards, nan=0.0, posinf=0.0, neginf=0.0
+        )
         is_std_zero = torch.isclose(std_rewards, torch.zeros_like(std_rewards))
         if self.scale_rewards != "none":
             advantages = advantages / (std_rewards + 1e-4)
+        advantages = torch.nan_to_num(
+            advantages, nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
@@ -3687,12 +4127,41 @@ class CoExTrainer(BaseTrainer):
 
         # metrics/logs
         for i, name in enumerate(diversity_reward_names):
-            self._metrics[mode][f"{adapter_name}/diversity_rewards/{name}/mean"].append(torch.nanmean(rewards_per_func[:, i]).item())
-            self._metrics[mode][f"{adapter_name}/diversity_rewards/{name}/std"].append(nanstd(rewards_per_func[:, i]).item())
+            if trace_diagnostics is not None:
+                values = torch.nan_to_num(
+                    rewards_per_func[:, i], nan=0.0, posinf=1.0, neginf=0.0
+                )
+                reward_mean = values.mean().item()
+                reward_std = values.std(unbiased=False).item()
+            else:
+                reward_mean = torch.nanmean(rewards_per_func[:, i]).item()
+                reward_std = nanstd(rewards_per_func[:, i]).item()
+            self._metrics[mode][f"{adapter_name}/diversity_rewards/{name}/mean"].append(reward_mean)
+            self._metrics[mode][f"{adapter_name}/diversity_rewards/{name}/std"].append(reward_std)
 
         self._metrics[mode][f"{adapter_name}/diversity_reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode][f"{adapter_name}/diversity_reward_std"].append(std_rewards.mean().item())
         self._metrics[mode][f"{adapter_name}/frac_diversity_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        if trace_diagnostics is not None:
+            reward_values = torch.nan_to_num(trace_diagnostics["reward"])
+            similarity_values = torch.nan_to_num(
+                trace_diagnostics["max_jaccard_similarity"]
+            )
+            trace_lengths = torch.nan_to_num(trace_diagnostics["trace_length"])
+            empty_traces = torch.nan_to_num(trace_diagnostics["empty_trace"])
+            comparison_sizes = torch.nan_to_num(trace_diagnostics["comparison_size"])
+            prefix = f"{adapter_name}/trace_jaccard"
+            self._metrics[mode][f"{prefix}/comparison_scope_intra_adapter"].append(
+                float(getattr(self.args, "diversity_comparison_scope", "intra_adapter") == "intra_adapter")
+            )
+            self._metrics[mode][f"{prefix}/reward_mean"].append(reward_values.mean().item())
+            self._metrics[mode][f"{prefix}/reward_std"].append(reward_values.std(unbiased=False).item())
+            self._metrics[mode][f"{prefix}/max_jaccard_similarity_mean"].append(similarity_values.mean().item())
+            self._metrics[mode][f"{prefix}/max_jaccard_similarity_std"].append(similarity_values.std(unbiased=False).item())
+            self._metrics[mode][f"{prefix}/trace_length_mean"].append(trace_lengths.mean().item())
+            self._metrics[mode][f"{prefix}/empty_trace_ratio"].append(empty_traces.mean().item())
+            self._metrics[mode][f"{prefix}/comparison_size_mean"].append(comparison_sizes.mean().item())
 
         for i, name in enumerate(diversity_reward_names):
             self._logs[f"{adapter_name}/diversity_rewards"][name].extend(rewards_per_func[:, i].tolist())
@@ -4209,6 +4678,201 @@ class CoExTrainer(BaseTrainer):
         else:
             return self._compute_loss(model, inputs)
 
+    @staticmethod
+    def _dmpo_loss_from_tensors(
+        current_per_token_logps: torch.Tensor,
+        completion_mask: torch.Tensor,
+        raw_rewards: torch.Tensor,
+        num_generations: int,
+        dmpo_temperature: float,
+        skip_zero_advantage_groups: bool = False,
+        reward_range_tolerance: float = 1e-8,
+    ):
+        if current_per_token_logps.shape != completion_mask.shape:
+            raise ValueError(
+                "current_per_token_logps and completion_mask must have identical shapes, got "
+                f"{tuple(current_per_token_logps.shape)} and {tuple(completion_mask.shape)}"
+            )
+        if raw_rewards.ndim != 1:
+            raise ValueError(f"raw_rewards must be 1-D, got shape {tuple(raw_rewards.shape)}")
+        if raw_rewards.shape[0] != current_per_token_logps.shape[0]:
+            raise ValueError(
+                "raw_rewards batch dimension must match current_per_token_logps, got "
+                f"{raw_rewards.shape[0]} and {current_per_token_logps.shape[0]}"
+            )
+        if num_generations <= 1:
+            raise ValueError(f"num_generations must be > 1 for DMPO, got {num_generations}")
+        if dmpo_temperature <= 0:
+            raise ValueError(f"dmpo_temperature must be positive, got {dmpo_temperature}")
+
+        batch_size = raw_rewards.shape[0]
+        if batch_size % num_generations != 0:
+            raise ValueError(
+                "DMPO requires complete prompt rollout groups on the local rank: "
+                f"batch_size={batch_size}, num_generations={num_generations}. "
+                "Use a group-preserving sampler/gather design before enabling distributed cross-rank groups."
+            )
+        num_prompt_groups = batch_size // num_generations
+
+        mask = completion_mask.to(dtype=current_per_token_logps.dtype)
+        seq_lengths = mask.sum(dim=-1).clamp(min=1.0)
+        seq_scores = (current_per_token_logps * mask).sum(dim=-1) / seq_lengths
+
+        group_scores = seq_scores.view(num_prompt_groups, num_generations)
+        group_rewards = raw_rewards.detach().float().view(num_prompt_groups, num_generations)
+
+        target_dist = torch.softmax(group_rewards / dmpo_temperature, dim=-1).detach()
+        policy_dist = torch.softmax(group_scores.float(), dim=-1)
+
+        reward_range = group_rewards.max(dim=-1).values - group_rewards.min(dim=-1).values
+        uniform_group_mask = reward_range <= reward_range_tolerance
+        if skip_zero_advantage_groups:
+            valid_group_mask = ~uniform_group_mask
+        else:
+            valid_group_mask = torch.ones_like(uniform_group_mask, dtype=torch.bool)
+
+        dm_loss_per_group = ((policy_dist - target_dist) ** 2).mean(dim=-1)
+        if valid_group_mask.any():
+            dm_loss = dm_loss_per_group[valid_group_mask].mean()
+        else:
+            dm_loss = group_scores.sum() * 0.0
+
+        with torch.no_grad():
+            eps = torch.finfo(torch.float32).eps
+            metric_policy = policy_dist.detach()
+            metric_target = target_dist.detach()
+            if valid_group_mask.any():
+                metric_policy_valid = metric_policy[valid_group_mask]
+                metric_target_valid = metric_target[valid_group_mask]
+                metric_scores_valid = group_scores.detach().float()[valid_group_mask]
+            else:
+                metric_policy_valid = metric_policy.new_zeros((1, num_generations))
+                metric_target_valid = metric_target.new_zeros((1, num_generations))
+                metric_scores_valid = group_scores.detach().float().new_zeros((1, num_generations))
+
+            target_entropy = -(
+                metric_target_valid * torch.log(metric_target_valid.clamp_min(eps))
+            ).sum(dim=-1).mean()
+            policy_entropy = -(
+                metric_policy_valid * torch.log(metric_policy_valid.clamp_min(eps))
+            ).sum(dim=-1).mean()
+            target_policy_mse = ((metric_policy_valid - metric_target_valid) ** 2).mean(dim=-1).mean()
+            target_policy_l1 = (metric_policy_valid - metric_target_valid).abs().mean(dim=-1).mean()
+            target_to_policy_kl = (
+                metric_target_valid
+                * (
+                    torch.log(metric_target_valid.clamp_min(eps))
+                    - torch.log(metric_policy_valid.clamp_min(eps))
+                )
+            ).sum(dim=-1).mean()
+
+            metrics = {
+                "target_entropy": target_entropy,
+                "policy_entropy": policy_entropy,
+                "target_policy_mse": target_policy_mse,
+                "target_policy_l1": target_policy_l1,
+                "target_to_policy_kl": target_to_policy_kl,
+                "target_max": metric_target_valid.max(),
+                "target_min": metric_target_valid.min(),
+                "policy_max": metric_policy_valid.max(),
+                "policy_min": metric_policy_valid.min(),
+                "uniform_reward_group_ratio": uniform_group_mask.float().mean(),
+                "valid_group_ratio": valid_group_mask.float().mean(),
+                "num_groups": torch.tensor(float(num_prompt_groups), device=seq_scores.device),
+                "mean_completion_score": metric_scores_valid.mean(),
+                "std_completion_score": metric_scores_valid.std(unbiased=False),
+            }
+
+        debug = {
+            "num_groups": num_prompt_groups,
+            "group_size": num_generations,
+            "raw_reward_shape": tuple(raw_rewards.shape),
+            "seq_score_shape": tuple(group_scores.shape),
+            "target_dist_shape": tuple(target_dist.shape),
+            "policy_dist_shape": tuple(policy_dist.shape),
+            "target_dist": target_dist,
+            "policy_dist": policy_dist,
+            "seq_scores": group_scores,
+            "target_row_sums": target_dist.detach().sum(dim=-1),
+            "policy_row_sums": policy_dist.detach().sum(dim=-1),
+            "target_requires_grad": target_dist.requires_grad,
+            "policy_requires_grad": policy_dist.requires_grad,
+        }
+        return dm_loss, metrics, debug
+
+    def _reduce_base_policy_loss(self, per_token_loss, completion_mask, inputs, base_loss_type):
+        if base_loss_type == "grpo":
+            return (
+                (per_token_loss * completion_mask).sum(-1)
+                / completion_mask.sum(-1).clamp(min=1.0)
+            ).mean()
+        if base_loss_type == "bnpo":
+            return (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+        if base_loss_type == "dr_grpo":
+            return (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+        if base_loss_type == "dapo":
+            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+            return (per_token_loss * completion_mask).sum() / normalizer
+        raise ValueError(f"Unknown base policy loss type: {base_loss_type}")
+
+    def _compute_dmpo_loss(self, current_per_token_logps, completion_mask, raw_rewards):
+        return self._dmpo_loss_from_tensors(
+            current_per_token_logps=current_per_token_logps,
+            completion_mask=completion_mask,
+            raw_rewards=raw_rewards,
+            num_generations=self.num_generations,
+            dmpo_temperature=self.dmpo_temperature,
+            skip_zero_advantage_groups=self.dmpo_skip_zero_advantage_groups,
+        )
+
+    @staticmethod
+    def _metric_scalar(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().float().item()
+        return float(value)
+
+    def _record_dmpo_metrics(self, mode, base_loss, dm_loss, total_loss, dm_metrics):
+        if not self.dmpo_log_metrics:
+            return
+        prefix = "train/dmpo" if mode == "train" else "eval/dmpo"
+        weighted_dm_loss = dm_loss.detach() * float(self.dmpo_beta)
+        values = {
+            "base_loss": base_loss.detach(),
+            "dm_loss": dm_loss.detach(),
+            "weighted_dm_loss": weighted_dm_loss,
+            "total_loss": total_loss.detach(),
+            **dm_metrics,
+        }
+        for name, value in values.items():
+            self._metrics[mode][f"{prefix}/{name}"].append(self._metric_scalar(value))
+
+    def _maybe_print_dmpo_sanity(self, base_loss, dm_loss, total_loss, debug):
+        if not self.dmpo_sanity_check or self._dmpo_sanity_printed:
+            return
+        if not self.accelerator.is_main_process:
+            return
+
+        def _short_list(tensor):
+            return tensor.detach().float().cpu()[: min(3, tensor.numel())].tolist()
+
+        print("[DMPO_SANITY]")
+        print(f"loss_type={self.loss_type}")
+        print(f"base_loss_type={self.dmpo_base_loss_type}")
+        print(f"num_groups={debug['num_groups']}")
+        print(f"group_size={debug['group_size']}")
+        print(f"raw_reward_shape={debug['raw_reward_shape']}")
+        print(f"seq_score_shape={debug['seq_score_shape']}")
+        print(f"target_dist_shape={debug['target_dist_shape']}")
+        print(f"policy_dist_shape={debug['policy_dist_shape']}")
+        print(f"target_row_sums={_short_list(debug['target_row_sums'])}")
+        print(f"policy_row_sums={_short_list(debug['policy_row_sums'])}")
+        print(f"target_requires_grad={debug['target_requires_grad']}")
+        print(f"policy_requires_grad={debug['policy_requires_grad']}")
+        print(f"base_loss={self._metric_scalar(base_loss)}")
+        print(f"dm_loss={self._metric_scalar(dm_loss)}")
+        print(f"total_loss={self._metric_scalar(total_loss)}")
+        self._dmpo_sanity_printed = True
+
     def _compute_loss(self, model, inputs):
         # Compute the per-token log probabilities for the model
         adapter_name = inputs.get("_adapter_name", "default")
@@ -4300,24 +4964,76 @@ class CoExTrainer(BaseTrainer):
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
-        if self.loss_type == "grpo":
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "bnpo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            loss = loss / self.current_gradient_accumulation_steps
-        elif self.loss_type == "dapo":
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
-            loss = (per_token_loss * completion_mask).sum() / normalizer
-            loss = loss / self.current_gradient_accumulation_steps
+        dm_metrics = None
+        dm_debug = None
+        if self.loss_type in {"grpo", "bnpo", "dr_grpo", "dapo"}:
+            base_loss_unscaled = self._reduce_base_policy_loss(
+                per_token_loss,
+                completion_mask,
+                inputs,
+                base_loss_type=self.loss_type,
+            )
+            total_loss_unscaled = base_loss_unscaled
+        elif self.loss_type == "dmpo":
+            raw_rewards = inputs.get("raw_rewards", inputs.get("correctness_reward_per_sample"))
+            if raw_rewards is None:
+                raise KeyError("DMPO requires raw_rewards or correctness_reward_per_sample in inputs.")
+            base_loss_unscaled = self._reduce_base_policy_loss(
+                per_token_loss,
+                completion_mask,
+                inputs,
+                base_loss_type=self.dmpo_base_loss_type,
+            )
+            should_apply_dm = adapter_name == "default"
+            if self.dmpo_candidate_scope == "main_only" and adapter_name != "default":
+                raise NotImplementedError("DMPO main_only currently supports only the default adapter update path.")
+            if should_apply_dm:
+                dm_loss_unscaled, dm_metrics, dm_debug = self._compute_dmpo_loss(
+                    current_per_token_logps=per_token_logps,
+                    completion_mask=completion_mask,
+                    raw_rewards=raw_rewards,
+                )
+                total_loss_unscaled = base_loss_unscaled + self.dmpo_beta * dm_loss_unscaled
+            else:
+                total_loss_unscaled = base_loss_unscaled
+        elif self.loss_type == "pure_dmpo":
+            raw_rewards = inputs.get("raw_rewards", inputs.get("correctness_reward_per_sample"))
+            if raw_rewards is None:
+                raise KeyError("pure_dmpo requires raw_rewards or correctness_reward_per_sample in inputs.")
+            if adapter_name == "default":
+                dm_loss_unscaled, dm_metrics, dm_debug = self._compute_dmpo_loss(
+                    current_per_token_logps=per_token_logps,
+                    completion_mask=completion_mask,
+                    raw_rewards=raw_rewards,
+                )
+                base_loss_unscaled = dm_loss_unscaled.new_zeros(())
+                total_loss_unscaled = self.dmpo_beta * dm_loss_unscaled
+            elif self.dmpo_candidate_scope == "collective":
+                base_loss_unscaled = per_token_loss.sum() * 0.0
+                total_loss_unscaled = base_loss_unscaled
+            else:
+                raise NotImplementedError("pure_dmpo main_only currently supports only the default adapter update path.")
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
+        loss = total_loss_unscaled / self.current_gradient_accumulation_steps
+
         # Log the metrics
         mode = "train" if self.model.training else "eval"
+        if dm_metrics is not None:
+            self._record_dmpo_metrics(
+                mode,
+                base_loss=base_loss_unscaled,
+                dm_loss=dm_loss_unscaled,
+                total_loss=total_loss_unscaled,
+                dm_metrics=dm_metrics,
+            )
+            self._maybe_print_dmpo_sanity(
+                base_loss=base_loss_unscaled,
+                dm_loss=dm_loss_unscaled,
+                total_loss=total_loss_unscaled,
+                debug=dm_debug,
+            )
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
 
