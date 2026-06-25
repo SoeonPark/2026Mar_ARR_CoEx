@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
+import json
 import os
 import textwrap
 import time
 import warnings
+import weakref
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -112,7 +115,7 @@ import torch
 from accelerate.utils import DistributedType
 
 if is_peft_available():
-    from peft import PeftConfig, PeftModel
+    from peft import PeftConfig, PeftModel, get_peft_model_state_dict
 
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -140,6 +143,25 @@ RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 # parameters and returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and
 # "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
 RolloutFunc = Callable[[list[str], Any, Any], dict[str, Any]]
+
+
+class LoRAIntegrityLoggingCallback(TrainerCallback):
+    """Observe LoRA optimizer boundaries without changing the training path."""
+
+    def __init__(self, trainer):
+        self._trainer_ref = weakref.ref(trainer)
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        trainer = self._trainer_ref()
+        if trainer is not None:
+            trainer._log_lora_optimizer_boundary("pre_optimizer_step")
+        return control
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        trainer = self._trainer_ref()
+        if trainer is not None:
+            trainer._log_lora_optimizer_boundary("post_optimizer_step")
+        return control
 
 
 class CoExTrainer(BaseTrainer):
@@ -334,6 +356,9 @@ class CoExTrainer(BaseTrainer):
 
         # For Sleep mode in vLLM
         self._vllm_slept = False
+        self._vllm_lora_hash_results = {}
+        self._source_trace_jsonl_path = None
+        self._source_trace_write_count = 0
 
         # Some models (SmolVLM/Idefics3) don't support `logits_to_keep` argument and error out if we pass it
         # Inspect the forward method before we wrap the model with PEFT
@@ -559,6 +584,9 @@ class CoExTrainer(BaseTrainer):
         # `_get_train_sampler` and `_prepare_inputs`.
         self._buffered_inputs = None
         self._last_loaded_step_per_adapter = {}
+        self._lora_switch_count = 0
+        self._lora_pre_optimizer_state = None
+        self._lora_integrity_callback_added = False
 
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -787,21 +815,20 @@ class CoExTrainer(BaseTrainer):
                 if is_peft_model(model):
                     self.lora_modules = []
                     for adapter_index, adapter_name in enumerate(self.all_adapter_names):
-                        adapter_path = os.path.join(self.lora_temp_dir, f"{adapter_name}_adapter")
-                        os.makedirs(adapter_path, exist_ok=True)
-
-                        # Save each adapter to a separate directory
-                        model.set_adapter(adapter_name)
-                        # Save only PEFT adapters to the adapter_path
-                        model.save_pretrained(adapter_path, save_adapter = True, save_config = True)
-
-                        self.lora_modules.append(
-                            {
-                                "name": adapter_name,
-                                "path": adapter_path,
-                                "id": adapter_index + 1, 
-                            }
+                        adapter_export_dir = os.path.join(self.lora_temp_dir, f"{adapter_name}_adapter")
+                        adapter_info = {
+                            "name": adapter_name,
+                            "export_dir": adapter_export_dir,
+                            "path": self._vllm_adapter_lora_path(adapter_export_dir, adapter_name),
+                            "id": adapter_index + 1,
+                        }
+                        self._save_adapter_for_vllm(
+                            model,
+                            adapter_info,
+                            phase="vllm_init_export",
+                            optimizer_step=0,
                         )
+                        self.lora_modules.append(adapter_info)
                     print(f"  >> [vLLM Init] LoRA modules saved to temporary cache directory: {self.lora_temp_dir} | Total adapters: {len(self.lora_modules)}")
             else:
                 raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
@@ -872,6 +899,10 @@ class CoExTrainer(BaseTrainer):
                         reward_func, evaluation_mode=True, device_placement=True
                     )
                     
+        self.add_callback(LoRAIntegrityLoggingCallback(self))
+        self._lora_integrity_callback_added = True
+        self._log_lora_integrity_snapshot("trainer_init", optimizer_step=0)
+
     def enable_all_lora_grads(self, model):
         """
         Force-enable gradients for all LoRA adapter layers in a PEFT model.
@@ -906,6 +937,7 @@ class CoExTrainer(BaseTrainer):
         self.enable_all_lora_grads(self.model)
         super().create_optimizer()
         self._assert_all_lora_in_optimizer()
+        self._log_lora_integrity_snapshot("after_optimizer_create", optimizer_step=0)
 
     import math
     
@@ -918,6 +950,835 @@ class CoExTrainer(BaseTrainer):
         tag3 = f".{adapter_name}_"
         tag4 = f"_{adapter_name}."
         return (tag1 in name) or (tag2 in name) or (tag3 in name) or (tag4 in name)
+
+    def _is_main_lora_logging_process(self) -> bool:
+        accelerator = getattr(self, "accelerator", None)
+        return accelerator is None or accelerator.is_main_process
+
+    @staticmethod
+    def _logging_active_adapter(model) -> str:
+        active = getattr(model, "active_adapter", None)
+        if active is None:
+            active = getattr(model, "active_adapters", None)
+        if isinstance(active, (list, tuple)):
+            return ",".join(str(name) for name in active)
+        return str(active)
+
+    def _set_adapter_with_logging(self, model, adapter_name, phase: str):
+        """Call PEFT set_adapter unchanged, then report the resulting state."""
+        before = self._logging_active_adapter(model)
+        output = model.set_adapter(adapter_name)
+        after = self._logging_active_adapter(model)
+        self._lora_switch_count += 1
+
+        if (
+            bool(getattr(self.args, "log_adapter_switches", True))
+            and self._is_main_lora_logging_process()
+        ):
+            active_trainable = 0
+            all_lora_trainable = 0
+            for name, param in model.named_parameters():
+                if "lora_" not in name or not param.requires_grad:
+                    continue
+                all_lora_trainable += param.numel()
+                if self._match_adapter_param(name, str(adapter_name)):
+                    active_trainable += param.numel()
+
+            print(
+                "[LORA_SWITCH] "
+                f"seq={self._lora_switch_count} "
+                f"global_step={getattr(self.state, 'global_step', 0)} "
+                f"micro_step={getattr(self, '_step', 0)} "
+                f"phase={phase} before={before} requested={adapter_name} after={after} "
+                f"changed={before != after} "
+                f"active_trainable_numel={active_trainable} "
+                f"all_lora_trainable_numel={all_lora_trainable}",
+                flush=True,
+            )
+        return output
+
+    def _should_log_lora_integrity(self, optimizer_step: int) -> bool:
+        interval = int(getattr(self.args, "adapter_sanity_check_steps", 0) or 0)
+        if interval <= 0:
+            return False
+        return optimizer_step in {0, 1} or optimizer_step % interval == 0
+
+    @torch.no_grad()
+    def _collect_lora_integrity(
+        self, adapter_names: Optional[list[str]] = None
+    ) -> dict[str, dict[str, Any]]:
+        adapter_names = list(adapter_names or self.all_adapter_names)
+        optimizer_ids = set()
+        if self.optimizer is not None:
+            optimizer_ids = {
+                id(param)
+                for group in self.optimizer.param_groups
+                for param in group["params"]
+            }
+
+        stats = {
+            adapter: {
+                "tensor_count": 0,
+                "numel": 0,
+                "trainable_numel": 0,
+                "optimizer_numel": 0,
+                "grad_numel": 0,
+                "a_norm_sum": None,
+                "b_norm_sum": None,
+                "weight_sum": None,
+                "weight_norm_sq": None,
+                "grad_norm_sq": None,
+                "samples": [],
+            }
+            for adapter in adapter_names
+        }
+
+        def add_scalar(container, key, value):
+            current = container[key]
+            container[key] = value if current is None else current + value
+
+        for name, param in self.model.named_parameters():
+            if param is None or "lora_" not in name:
+                continue
+
+            adapter_name = next(
+                (
+                    adapter
+                    for adapter in adapter_names
+                    if self._match_adapter_param(name, adapter)
+                ),
+                None,
+            )
+            if adapter_name is None:
+                continue
+
+            stat = stats[adapter_name]
+            stat["tensor_count"] += 1
+            stat["numel"] += param.numel()
+            if param.requires_grad:
+                stat["trainable_numel"] += param.numel()
+            if id(param) in optimizer_ids:
+                stat["optimizer_numel"] += param.numel()
+
+            value = param.detach().float()
+            value_norm = torch.linalg.vector_norm(value)
+            add_scalar(stat, "weight_sum", value.sum())
+            add_scalar(stat, "weight_norm_sq", value_norm * value_norm)
+            if "lora_A" in name:
+                add_scalar(stat, "a_norm_sum", value_norm)
+            elif "lora_B" in name:
+                add_scalar(stat, "b_norm_sum", value_norm)
+
+            flat = value.reshape(-1)
+            if flat.numel() > 0:
+                stride = max(1, flat.numel() // 4)
+                stat["samples"].append(flat[::stride][:4])
+
+            if param.grad is not None:
+                grad = param.grad.detach().float()
+                grad_norm = torch.linalg.vector_norm(grad)
+                add_scalar(stat, "grad_norm_sq", grad_norm * grad_norm)
+                stat["grad_numel"] += grad.numel()
+
+        result = {}
+        for adapter_name, stat in stats.items():
+            sample = (
+                torch.cat(stat["samples"]).detach().cpu()
+                if stat["samples"]
+                else torch.empty(0)
+            )
+            result[adapter_name] = {
+                "tensor_count": stat["tensor_count"],
+                "numel": stat["numel"],
+                "trainable_numel": stat["trainable_numel"],
+                "optimizer_numel": stat["optimizer_numel"],
+                "grad_numel": stat["grad_numel"],
+                "lora_A_norm_sum": (
+                    float(stat["a_norm_sum"].item())
+                    if stat["a_norm_sum"] is not None
+                    else 0.0
+                ),
+                "lora_B_norm_sum": (
+                    float(stat["b_norm_sum"].item())
+                    if stat["b_norm_sum"] is not None
+                    else 0.0
+                ),
+                "weight_sum": (
+                    float(stat["weight_sum"].item())
+                    if stat["weight_sum"] is not None
+                    else 0.0
+                ),
+                "weight_norm": (
+                    float(torch.sqrt(stat["weight_norm_sq"]).item())
+                    if stat["weight_norm_sq"] is not None
+                    else 0.0
+                ),
+                "grad_norm": (
+                    float(torch.sqrt(stat["grad_norm_sq"]).item())
+                    if stat["grad_norm_sq"] is not None
+                    else 0.0
+                ),
+                "_sample": sample,
+            }
+        return result
+
+    def _print_lora_integrity(
+        self,
+        tag: str,
+        optimizer_step: int,
+        summary: dict[str, dict[str, Any]],
+        baseline: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        active = self._logging_active_adapter(self.model)
+        print(
+            f"[LORA_INTEGRITY] tag={tag} optimizer_step={optimizer_step} "
+            f"global_step={getattr(self.state, 'global_step', 0)} active={active}",
+            flush=True,
+        )
+
+        for adapter_name in summary:
+            stat = summary[adapter_name]
+            previous = baseline.get(adapter_name) if baseline is not None else None
+            sample_delta = None
+            weight_sum_delta = None
+            weight_norm_delta = None
+            updated = None
+            if previous is not None:
+                current_sample = stat["_sample"]
+                previous_sample = previous["_sample"]
+                if current_sample.shape == previous_sample.shape:
+                    sample_delta = float(
+                        torch.linalg.vector_norm(
+                            current_sample.float() - previous_sample.float()
+                        ).item()
+                    )
+                weight_sum_delta = stat["weight_sum"] - previous["weight_sum"]
+                weight_norm_delta = stat["weight_norm"] - previous["weight_norm"]
+                updated = bool(
+                    (sample_delta is not None and sample_delta > 0.0)
+                    or abs(weight_sum_delta) > 0.0
+                    or abs(weight_norm_delta) > 0.0
+                )
+
+            print(
+                "  [LORA_ADAPTER] "
+                f"name={adapter_name} tensors={stat['tensor_count']} "
+                f"numel={stat['numel']} trainable_numel={stat['trainable_numel']} "
+                f"optimizer_numel={stat['optimizer_numel']} "
+                f"grad_numel={stat['grad_numel']} "
+                f"A_norm_sum={stat['lora_A_norm_sum']:.8e} "
+                f"B_norm_sum={stat['lora_B_norm_sum']:.8e} "
+                f"weight_norm={stat['weight_norm']:.8e} "
+                f"grad_norm={stat['grad_norm']:.8e} "
+                f"sample_delta_l2={sample_delta if sample_delta is not None else 'NA'} "
+                f"weight_sum_delta={weight_sum_delta if weight_sum_delta is not None else 'NA'} "
+                f"weight_norm_delta={weight_norm_delta if weight_norm_delta is not None else 'NA'} "
+                f"updated={updated if updated is not None else 'NA'}",
+                flush=True,
+            )
+
+    def _log_lora_integrity_snapshot(
+        self,
+        tag: str,
+        optimizer_step: int,
+        baseline: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        if (
+            not self._is_main_lora_logging_process()
+            or not self._should_log_lora_integrity(optimizer_step)
+        ):
+            return None
+        summary = self._collect_lora_integrity()
+        self._print_lora_integrity(tag, optimizer_step, summary, baseline)
+        return summary
+
+    def _log_lora_optimizer_boundary(self, tag: str) -> None:
+        optimizer_step = int(getattr(self.state, "global_step", 0)) + 1
+        if (
+            not self._is_main_lora_logging_process()
+            or not self._should_log_lora_integrity(optimizer_step)
+        ):
+            return
+
+        summary = self._collect_lora_integrity()
+        if tag == "pre_optimizer_step":
+            self._lora_pre_optimizer_state = summary
+            self._print_lora_integrity(tag, optimizer_step, summary)
+        elif tag == "post_optimizer_step":
+            self._print_lora_integrity(
+                tag,
+                optimizer_step,
+                summary,
+                baseline=self._lora_pre_optimizer_state,
+            )
+            self._lora_pre_optimizer_state = None
+
+
+
+    def _vllm_adapter_lora_path(self, export_dir: str, adapter_name: str) -> str:
+        """Return the directory that vLLM should load as the LoRA root."""
+        if adapter_name == "default":
+            return export_dir
+        return os.path.join(export_dir, adapter_name)
+
+    def _get_lora_module_info(self, adapter_name: str) -> dict[str, Any] | None:
+        for module in self.lora_modules or []:
+            if module.get("name") == adapter_name:
+                return module
+        return None
+
+    def _should_check_vllm_lora_hash(self, optimizer_step: int | None = None) -> bool:
+        if not bool(getattr(self.args, "vllm_lora_hash_check", False)):
+            return False
+        interval = int(getattr(self.args, "vllm_lora_hash_check_interval", 1) or 1)
+        step = int(optimizer_step if optimizer_step is not None else getattr(self.state, "global_step", 0))
+        return step in {0, 1} or step % interval == 0
+
+    @staticmethod
+    def _tensor_sha256(tensor: torch.Tensor) -> str:
+        value = tensor.detach().cpu().contiguous()
+        raw = value.view(torch.uint8).numpy().tobytes()
+        return hashlib.sha256(raw).hexdigest()
+
+    def _tensor_manifest_from_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
+        entries = {}
+        for key in sorted(state_dict):
+            tensor = state_dict[key]
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            entries[key] = {
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "sha256": self._tensor_sha256(tensor),
+            }
+        payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return {
+            "manifest": hashlib.sha256(payload).hexdigest(),
+            "num_tensors": len(entries),
+            "entries": entries,
+        }
+
+    @torch.no_grad()
+    def _training_lora_manifest(self, model: nn.Module, adapter_name: str) -> dict[str, Any]:
+        state = get_peft_model_state_dict(model, adapter_name=adapter_name)
+        return self._tensor_manifest_from_state_dict(state)
+
+    def _export_lora_manifest(self, lora_path: str) -> dict[str, Any]:
+        from safetensors.torch import load_file
+
+        safetensors_path = os.path.join(lora_path, "adapter_model.safetensors")
+        if not os.path.exists(safetensors_path):
+            raise FileNotFoundError(
+                f"Expected exported LoRA safetensors at {safetensors_path}. "
+                "vLLM lora_local_path must point at a directory containing adapter_model.safetensors."
+            )
+        state = load_file(safetensors_path, device="cpu")
+        manifest = self._tensor_manifest_from_state_dict(state)
+        manifest["safetensors_path"] = safetensors_path
+        return manifest
+
+    def _compare_lora_manifests(
+        self,
+        training_manifest: dict[str, Any],
+        export_manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        train_entries = training_manifest["entries"]
+        export_entries = export_manifest["entries"]
+        train_keys = set(train_entries)
+        export_keys = set(export_entries)
+        missing = sorted(train_keys - export_keys)
+        unexpected = sorted(export_keys - train_keys)
+        mismatched = sorted(
+            key
+            for key in train_keys & export_keys
+            if train_entries[key] != export_entries[key]
+        )
+        mismatch_count = len(missing) + len(unexpected) + len(mismatched)
+        return {
+            "mismatch_count": mismatch_count,
+            "missing_keys": missing,
+            "unexpected_keys": unexpected,
+            "mismatched_keys": mismatched,
+            "status": "PASS" if mismatch_count == 0 else "FAIL",
+        }
+
+    def _check_vllm_lora_export_hash(
+        self,
+        model: nn.Module,
+        adapter_name: str,
+        lora_path: str,
+        optimizer_step: int | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._should_check_vllm_lora_hash(optimizer_step):
+            return None
+        if not self._is_main_lora_logging_process():
+            return None
+
+        training_manifest = self._training_lora_manifest(model, adapter_name)
+        export_manifest = self._export_lora_manifest(lora_path)
+        comparison = self._compare_lora_manifests(training_manifest, export_manifest)
+        total = max(training_manifest["num_tensors"], export_manifest["num_tensors"])
+        result = {
+            "adapter": adapter_name,
+            "requested_path": lora_path,
+            "training_manifest": training_manifest["manifest"],
+            "export_manifest": export_manifest["manifest"],
+            "training_num_tensors": training_manifest["num_tensors"],
+            "export_num_tensors": export_manifest["num_tensors"],
+            **comparison,
+        }
+        self._vllm_lora_hash_results[adapter_name] = result
+
+        tag = "VLLM_LORA_HASH" if comparison["status"] == "PASS" else "VLLM_LORA_HASH_ERROR"
+        print(
+            f"[{tag}] adapter={adapter_name} requested_path={lora_path} "
+            f"training_manifest={training_manifest['manifest']} "
+            f"export_manifest={export_manifest['manifest']} "
+            f"mismatch={comparison['mismatch_count']}/{total} status={comparison['status']}",
+            flush=True,
+        )
+        if comparison["status"] != "PASS":
+            print(
+                f"[{tag}_DETAIL] adapter={adapter_name} "
+                f"missing_first={comparison['missing_keys'][:5]} "
+                f"unexpected_first={comparison['unexpected_keys'][:5]} "
+                f"mismatched_first={comparison['mismatched_keys'][:5]}",
+                flush=True,
+            )
+            if bool(getattr(self.args, "vllm_lora_hash_check_strict", True)):
+                raise RuntimeError(
+                    f"vLLM LoRA export hash check failed for adapter={adapter_name}: "
+                    f"{comparison['mismatch_count']}/{total} mismatched at {lora_path}"
+                )
+        return result
+
+    def _save_adapter_for_vllm(
+        self,
+        model: nn.Module,
+        adapter_info: dict[str, Any],
+        phase: str,
+        optimizer_step: int | None = None,
+    ) -> dict[str, Any] | None:
+        adapter_name = adapter_info["name"]
+        export_dir = adapter_info.get("export_dir") or adapter_info.get("path")
+        if export_dir is None:
+            export_dir = os.path.join(self.lora_temp_dir, f"{adapter_name}_adapter")
+        os.makedirs(export_dir, exist_ok=True)
+
+        self._set_adapter_with_logging(model, adapter_name, phase)
+        self.enable_all_lora_grads(model)
+        model.save_pretrained(
+            export_dir,
+            save_adapter=True,
+            save_config=True,
+            safe_serialization=True,
+            selected_adapters=[adapter_name],
+        )
+        lora_path = self._vllm_adapter_lora_path(export_dir, adapter_name)
+        adapter_info["export_dir"] = export_dir
+        adapter_info["path"] = lora_path
+        hash_result = self._check_vllm_lora_export_hash(
+            model,
+            adapter_name,
+            lora_path,
+            optimizer_step=optimizer_step,
+        )
+        if hash_result is not None:
+            adapter_info["training_manifest"] = hash_result["training_manifest"]
+            adapter_info["export_manifest"] = hash_result["export_manifest"]
+            adapter_info["adapter_hash_match"] = hash_result["status"] == "PASS"
+        return hash_result
+
+
+
+    def _source_trace_enabled(self) -> bool:
+        return bool(getattr(self.args, "source_owned_trace", False))
+
+    def _should_log_source_trace(self) -> bool:
+        if not self._source_trace_enabled() or not self._is_main_lora_logging_process():
+            return False
+        interval = int(getattr(self.args, "source_owned_trace_log_steps", 1) or 1)
+        step = int(getattr(self.state, "global_step", 0)) + 1
+        return step in {0, 1} or step % interval == 0
+
+    @staticmethod
+    def _json_safe_scalar(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.detach().cpu().item()
+            return value.detach().cpu().tolist()
+        try:
+            if isinstance(value, (float, int, str, bool)):
+                return value
+            if hasattr(value, "item"):
+                return value.item()
+        except Exception:
+            pass
+        return value
+
+    @staticmethod
+    def _mean_float(values) -> float | None:
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            if values.numel() == 0:
+                return None
+            return float(values.detach().float().mean().cpu().item())
+        if len(values) == 0:
+            return None
+        return float(sum(float(v) for v in values) / len(values))
+
+    def _problem_id_from_input(self, example: dict[str, Any]) -> Any:
+        for key in ("problem_id", "id", "idx", "sample_id", "question_id"):
+            if key in example:
+                return self._json_safe_scalar(example.get(key))
+        return None
+
+    def _build_source_trace_metadata(
+        self,
+        input_example: dict[str, Any],
+        source_adapter_name: str,
+        source_adapter_idx: int,
+        original_index: int,
+        completion_index_within_adapter: int,
+        completion_ids: list[int],
+        sampling_logps,
+    ) -> dict[str, Any]:
+        adapter_info = self._get_lora_module_info(source_adapter_name) or {}
+        hash_result = self._vllm_lora_hash_results.get(source_adapter_name, {})
+        adapter_hash_match = hash_result.get("status") == "PASS"
+        backend = "vllm" if self.use_vllm else ("transformers_paged" if self.use_transformers_paged else "transformers")
+        prompt_index = int(original_index // max(1, self.num_generations))
+        sample_id = (
+            f"step{int(getattr(self.state, 'global_step', 0))}::prompt{prompt_index}::"
+            f"{source_adapter_name}::sample{completion_index_within_adapter}"
+        )
+        return {
+            "sample_id": sample_id,
+            "global_step": int(getattr(self.state, "global_step", 0)),
+            "prompt_index": prompt_index,
+            "problem_id": self._problem_id_from_input(input_example),
+            "source_adapter_name": source_adapter_name,
+            "source_adapter_idx": int(source_adapter_idx),
+            "completion_index_within_adapter": int(completion_index_within_adapter),
+            "original_flat_index": int(original_index),
+            "is_main": source_adapter_name == "default",
+            "is_diversity": source_adapter_name != "default",
+            "generation_backend": backend,
+            "requested_source_adapter": source_adapter_name,
+            "vllm_lora_name": adapter_info.get("name") if self.use_vllm else None,
+            "vllm_lora_int_id": adapter_info.get("id") if self.use_vllm else None,
+            "vllm_lora_local_path": adapter_info.get("path") if self.use_vllm else None,
+            "expected_adapter_manifest": hash_result.get("training_manifest"),
+            "exported_adapter_manifest": hash_result.get("export_manifest"),
+            "adapter_hash_match": adapter_hash_match if hash_result else None,
+            "verified_generation_policy": source_adapter_name if (not self.use_vllm or adapter_hash_match) else "unverified",
+            "sampling_logprobs_available": sampling_logps is not None,
+            "sampling_logprob_source": "vllm" if (self.use_vllm and sampling_logps is not None) else None,
+            "sampling_logprob_adapter": source_adapter_name if sampling_logps is not None else None,
+            "sampling_logprob_mean": self._mean_float(sampling_logps),
+            "completion_length": len(completion_ids),
+            "completion_mask_sum": len(completion_ids),
+        }
+
+    def _row_masked_mean_list(self, values: torch.Tensor | None, mask: torch.Tensor) -> list[float | None]:
+        batch = int(mask.shape[0])
+        if values is None:
+            return [None] * batch
+        detached = values.detach().float()
+        if detached.ndim == 2 and detached.shape == mask.shape:
+            denom = mask.detach().float().sum(dim=-1).clamp(min=1.0)
+            return ((detached * mask.detach().float()).sum(dim=-1) / denom).cpu().tolist()
+        if detached.ndim == 2 and detached.shape[0] == batch and detached.shape[1] == 1:
+            return detached[:, 0].cpu().tolist()
+        if detached.ndim == 1 and detached.shape[0] == batch:
+            return detached.cpu().tolist()
+        return [None] * batch
+
+    def _masked_flat_stats(self, values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+        detached = values.detach().float()
+        if detached.ndim == 2 and detached.shape == mask.shape:
+            flat = detached[mask.bool()]
+        elif detached.ndim == 2 and detached.shape[1] == 1:
+            flat = detached[:, 0]
+        else:
+            flat = detached.reshape(-1)
+        if flat.numel() == 0:
+            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "mean": float(flat.mean().item()),
+            "std": float(flat.std(unbiased=False).item()) if flat.numel() > 1 else 0.0,
+            "min": float(flat.min().item()),
+            "max": float(flat.max().item()),
+        }
+
+    def _write_source_trace_records(self, records: list[dict[str, Any]]) -> None:
+        if not records or not self._source_trace_enabled() or not self._is_main_lora_logging_process():
+            return
+        if self._source_trace_jsonl_path is None:
+            output_dir = Path(getattr(self.args, "output_dir", "trainer_output"))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._source_trace_jsonl_path = str(output_dir / "source_owned_rollout_metadata.jsonl")
+        with open(self._source_trace_jsonl_path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        self._source_trace_write_count += len(records)
+
+    def _expected_update_scope(self, adapter_name: str) -> str:
+        if adapter_name == "default":
+            return "collective_correctness"
+        return "source_owned_adapter"
+
+    def _expected_advantage_source(self, adapter_name: str) -> str:
+        if adapter_name == "default":
+            return "correctness_only_collective"
+        if bool(getattr(self.args, "no_div", False)):
+            return "correctness_only_source_owned"
+        if bool(getattr(self.args, "no_correctness", False)):
+            return "diversity_only_source_owned"
+        return "correctness_plus_diversity_reward_source_owned"
+
+    def _annotate_and_verify_update_semantics(
+        self,
+        generation_batch: dict[str, Any],
+        adapter_name: str,
+    ) -> None:
+        expected_update_scope = self._expected_update_scope(adapter_name)
+        advantage_source = self._expected_advantage_source(adapter_name)
+        generation_batch["expected_update_scope"] = expected_update_scope
+        generation_batch["update_scope"] = expected_update_scope
+        generation_batch["advantage_source"] = advantage_source
+
+        advantages = generation_batch.get("advantages")
+        correctness_advantages = generation_batch.get("correctness_advantages")
+        diversity_advantages = generation_batch.get("diversity_advantages")
+        verified = True
+
+        if isinstance(advantages, torch.Tensor):
+            if adapter_name == "default":
+                reference = correctness_advantages
+            elif bool(getattr(self.args, "no_div", False)):
+                reference = correctness_advantages
+            elif bool(getattr(self.args, "no_correctness", False)):
+                reference = diversity_advantages
+            else:
+                if correctness_advantages is None or diversity_advantages is None:
+                    reference = None
+                else:
+                    reference = (
+                        float(getattr(self.args, "correctness_weight_specialist", 0.0)) * correctness_advantages
+                        + float(getattr(self.args, "diversity_weight_specialist", 0.0)) * diversity_advantages
+                    )
+
+            if isinstance(reference, torch.Tensor):
+                verified = torch.allclose(
+                    advantages.detach().float(),
+                    reference.detach().float(),
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
+                if not bool(verified):
+                    max_abs_diff = (
+                        advantages.detach().float() - reference.detach().float()
+                    ).abs().max().item()
+                    raise AssertionError(
+                        f"Advantage source mismatch for adapter={adapter_name}: "
+                        f"advantage_source={advantage_source}, max_abs_diff={max_abs_diff}"
+                    )
+
+        generation_batch["advantage_source_verified"] = bool(verified)
+
+        source_trace_metadata = generation_batch.get("source_trace_metadata")
+        if isinstance(source_trace_metadata, list):
+            if adapter_name != "default":
+                bad_sources = [
+                    record.get("source_adapter_name")
+                    for record in source_trace_metadata
+                    if isinstance(record, dict) and record.get("source_adapter_name") != adapter_name
+                ]
+                if bad_sources:
+                    raise AssertionError(
+                        f"Diversity adapter update received non-source-owned samples: "
+                        f"adapter={adapter_name}, bad_sources={bad_sources[:10]}"
+                    )
+
+            for record in source_trace_metadata:
+                if isinstance(record, dict):
+                    record["planned_update_scope"] = expected_update_scope
+                    record["planned_advantage_source"] = advantage_source
+                    record["planned_advantage_source_verified"] = bool(verified)
+
+    def _emit_ratio_trace_and_metadata(
+        self,
+        inputs: dict[str, Any],
+        adapter_name: str,
+        per_token_logps: torch.Tensor,
+        old_per_token_logps: torch.Tensor,
+        old_was_provided: bool,
+        log_ratio: torch.Tensor,
+        ratio: torch.Tensor,
+        clip_mask: torch.Tensor,
+        advantages: torch.Tensor,
+        completion_mask: torch.Tensor,
+        loss: torch.Tensor,
+    ) -> None:
+        if not self._source_trace_enabled():
+            return
+
+        old_source_type = "hf_recomputed_adapter" if old_was_provided else "current_detach"
+        old_adapter = adapter_name if old_was_provided else f"{adapter_name}_current_detach"
+        old_denominator_policy = adapter_name
+        expected_update_scope = inputs.get("expected_update_scope") or self._expected_update_scope(adapter_name)
+        update_scope = inputs.get("update_scope") or expected_update_scope
+        update_scope_ok = update_scope == expected_update_scope
+        source_owned_required = adapter_name != "default"
+        advantage_source = inputs.get("advantage_source") or self._expected_advantage_source(adapter_name)
+        advantage_source_verified = bool(inputs.get("advantage_source_verified", False))
+        metadata = inputs.get("source_trace_metadata") or []
+        if isinstance(metadata, tuple):
+            metadata = list(metadata)
+
+        old_means = self._row_masked_mean_list(old_per_token_logps, completion_mask)
+        current_means = self._row_masked_mean_list(per_token_logps, completion_mask)
+        log_ratio_means = self._row_masked_mean_list(log_ratio, completion_mask)
+        ratio_means = self._row_masked_mean_list(ratio, completion_mask)
+        mask_sums = completion_mask.detach().float().sum(dim=-1).cpu().tolist()
+        advantages_list = advantages.detach().float().cpu().tolist()
+        correctness_rewards = inputs.get("correctness_reward_per_sample")
+        diversity_rewards = inputs.get("diversity_reward_per_sample")
+        correctness_list = (
+            correctness_rewards.detach().float().cpu().tolist()
+            if isinstance(correctness_rewards, torch.Tensor)
+            else [None] * len(advantages_list)
+        )
+        diversity_list = (
+            diversity_rewards.detach().float().cpu().tolist()
+            if isinstance(diversity_rewards, torch.Tensor)
+            else [None] * len(advantages_list)
+        )
+
+        updated_records = []
+        for i, record in enumerate(metadata):
+            if not isinstance(record, dict):
+                continue
+            behavior_policy = record.get("source_adapter_name")
+            behavior_equals_old = behavior_policy == old_denominator_policy
+            old_equals_update = old_denominator_policy == adapter_name
+            raw_source_owned_ok = bool(behavior_equals_old and old_equals_update and behavior_policy == adapter_name)
+            source_owned_ok = raw_source_owned_ok if source_owned_required else None
+            if source_owned_required and not raw_source_owned_ok:
+                raise AssertionError(
+                    f"Source-owned update invariant failed for adapter={adapter_name}: "
+                    f"behavior_policy={behavior_policy}, old_denominator_policy={old_denominator_policy}, "
+                    f"update_adapter={adapter_name}, sample_id={record.get('sample_id')}"
+                )
+            corr = correctness_list[i] if i < len(correctness_list) else None
+            div = diversity_list[i] if i < len(diversity_list) else None
+            if adapter_name == "default" or div is None:
+                combined_reward = corr
+            elif corr is None:
+                combined_reward = div
+            else:
+                combined_reward = (
+                    float(getattr(self.args, "correctness_weight_specialist", 0.0)) * corr
+                    + float(getattr(self.args, "diversity_weight_specialist", 0.0)) * div
+                )
+            record.update(
+                {
+                    "loss_record_id": f"{record.get('sample_id')}::update::{adapter_name}",
+                    "old_logprob_source_type": old_source_type,
+                    "old_logprob_adapter": old_adapter,
+                    "old_logprob_denominator_policy": old_denominator_policy,
+                    "current_logprob_adapter": adapter_name,
+                    "update_adapter": adapter_name,
+                    "expected_update_scope": expected_update_scope,
+                    "update_scope": update_scope,
+                    "update_scope_ok": update_scope_ok,
+                    "source_owned_update_required": source_owned_required,
+                    "source_owned_update_ok": source_owned_ok,
+                    "raw_source_owned_update_ok": raw_source_owned_ok,
+                    "behavior_equals_old_denominator": behavior_equals_old,
+                    "old_equals_update_source": old_equals_update,
+                    "advantage_source": advantage_source,
+                    "advantage_source_verified": advantage_source_verified,
+                    "ratio_expected_near_one": old_source_type == "current_detach",
+                    "old_logprob_mean": old_means[i] if i < len(old_means) else None,
+                    "current_logprob_mean": current_means[i] if i < len(current_means) else None,
+                    "log_ratio_mean": log_ratio_means[i] if i < len(log_ratio_means) else None,
+                    "ratio_mean": ratio_means[i] if i < len(ratio_means) else None,
+                    "completion_mask_sum": mask_sums[i] if i < len(mask_sums) else None,
+                    "correctness_reward": corr,
+                    "diversity_reward": div,
+                    "combined_reward": combined_reward,
+                    "advantage": advantages_list[i] if i < len(advantages_list) else None,
+                }
+            )
+            updated_records.append(record)
+
+        self._write_source_trace_records(updated_records)
+
+        if not self._should_log_source_trace():
+            return
+        source_policies = sorted({str(r.get("source_adapter_name")) for r in metadata if isinstance(r, dict)})
+        requested_policies = sorted({str(r.get("requested_source_adapter")) for r in metadata if isinstance(r, dict)})
+        verified_policies = sorted({str(r.get("verified_generation_policy")) for r in metadata if isinstance(r, dict)})
+        behavior_policy = source_policies[0] if len(source_policies) == 1 else f"mixed({','.join(source_policies)})"
+        requested_policy = requested_policies[0] if len(requested_policies) == 1 else f"mixed({','.join(requested_policies)})"
+        verified_policy = verified_policies[0] if len(verified_policies) == 1 else f"mixed({','.join(verified_policies)})"
+        if source_owned_required:
+            batch_source_owned = all(r.get("source_owned_update_ok") is True for r in updated_records) if updated_records else False
+        else:
+            batch_source_owned = "NA_collective_correctness"
+        log_ratio_stats = self._masked_flat_stats(log_ratio, completion_mask)
+        ratio_stats = self._masked_flat_stats(ratio, completion_mask)
+        clip_values = clip_mask.detach().float()
+        clip_frac = self._masked_flat_stats(clip_values, completion_mask)["mean"]
+        adv = advantages.detach().float()
+        adv_std = float(adv.std(unbiased=False).item()) if adv.numel() > 1 else 0.0
+        nonzero_adv = float((adv.abs() > 0).float().mean().item()) if adv.numel() > 0 else 0.0
+        corr_tensor = correctness_rewards.detach().float() if isinstance(correctness_rewards, torch.Tensor) else None
+        div_tensor = diversity_rewards.detach().float() if isinstance(diversity_rewards, torch.Tensor) else None
+        corr_mean = float(corr_tensor.mean().item()) if corr_tensor is not None and corr_tensor.numel() > 0 else None
+        div_mean = float(div_tensor.mean().item()) if div_tensor is not None and div_tensor.numel() > 0 else None
+        div_std = float(div_tensor.std(unbiased=False).item()) if div_tensor is not None and div_tensor.numel() > 1 else 0.0
+        combined_values = [r.get("combined_reward") for r in updated_records if r.get("combined_reward") is not None]
+        combined_mean = sum(combined_values) / len(combined_values) if combined_values else None
+        print(
+            "[RATIO_TRACE] "
+            f"step={getattr(self.state, 'global_step', 0)} adapter={adapter_name} num_samples={len(metadata)} "
+            f"behavior_policy={behavior_policy} requested_generation_policy={requested_policy} "
+            f"verified_generation_policy={verified_policy} old_logprob_source_type={old_source_type} "
+            f"old_logprob_adapter={old_adapter} current_logprob_adapter={adapter_name} update_adapter={adapter_name} "
+            f"expected_update_scope={expected_update_scope} update_scope={update_scope} update_scope_ok={update_scope_ok} "
+            f"source_owned_update_required={source_owned_required} source_owned_update_ok={batch_source_owned} "
+            f"advantage_source={advantage_source} advantage_source_verified={advantage_source_verified} "
+            f"behavior_equals_old_denominator={behavior_policy == old_denominator_policy} "
+            f"old_equals_update_source={old_denominator_policy == adapter_name} "
+            f"old_logps_mean={self._masked_flat_stats(old_per_token_logps, completion_mask)['mean']:.6e} "
+            f"current_logps_mean={self._masked_flat_stats(per_token_logps, completion_mask)['mean']:.6e} "
+            f"log_ratio_mean={log_ratio_stats['mean']:.6e} log_ratio_std={log_ratio_stats['std']:.6e} "
+            f"ratio_mean={ratio_stats['mean']:.6e} ratio_std={ratio_stats['std']:.6e} "
+            f"ratio_min={ratio_stats['min']:.6e} ratio_max={ratio_stats['max']:.6e} "
+            f"clip_frac={clip_frac:.6e} advantage_mean={float(adv.mean().item()) if adv.numel() else 0.0:.6e} "
+            f"advantage_std={adv_std:.6e} completion_mask_sum={float(completion_mask.sum().item()):.1f}",
+            flush=True,
+        )
+        print(
+            "[REWARD_ADV_TRACE] "
+            f"step={getattr(self.state, 'global_step', 0)} adapter={adapter_name} "
+            f"diversity_reward_mean={div_mean} diversity_reward_std={div_std} "
+            f"correctness_reward_mean={corr_mean} combined_reward_mean={combined_mean} "
+            f"advantage_mean={float(adv.mean().item()) if adv.numel() else 0.0:.6e} "
+            f"advantage_std={adv_std:.6e} advantage_abs_mean={float(adv.abs().mean().item()) if adv.numel() else 0.0:.6e} "
+            f"nonzero_advantage_ratio={nonzero_adv:.6e} "
+            f"completion_mask_sum_mean={float(completion_mask.detach().float().sum(dim=-1).mean().item()):.6e} "
+            f"loss={float(loss.detach().float().cpu().item()):.6e} grad_norm=NA_pre_backward",
+            flush=True,
+        )
+
+
 
     @torch.no_grad()
     def _lora_fingerprint(self, model: nn.Module, adapter_name: str) -> torch.Tensor:
@@ -1126,7 +1987,7 @@ class CoExTrainer(BaseTrainer):
             total_loss = []
 
             for adapter_name, adapter_inputs in inputs.items():
-                self.model.set_adapter(adapter_name)
+                self._set_adapter_with_logging(self.model, adapter_name, "training_backward")
                 self.enable_all_lora_grads(self.model)
                 adapter_inputs["_adapter_name"] = adapter_name
 
@@ -1761,7 +2622,7 @@ class CoExTrainer(BaseTrainer):
                 llm_model.load_weights([(name, param)])
 
     def _reload_lora_in_vllm_colocate(self, adapter_info: dict):
-        # adapter_info: {"name": str, "path": str, "id": int}
+        # adapter_info: {"name": str, "export_dir": str, "path": str, "id": int}; path is the actual vLLM LoRA root.
         if not (self.use_vllm and self.vllm_mode == "colocate"):
             return
         eng = getattr(self.llm, "llm_engine", None)
@@ -1777,11 +2638,17 @@ class CoExTrainer(BaseTrainer):
         # add new
         try:
             from vllm.lora.request import LoRARequest
+            lora_path = adapter_info["path"]
+            print(
+                f"[VLLM_LORA_REQUEST] adapter={adapter_info['name']} id={adapter_info['id']} "
+                f"lora_local_path={lora_path}",
+                flush=True,
+            )
             ok = eng.add_lora(
                 LoRARequest(
                     lora_name=adapter_info["name"],
                     lora_int_id=adapter_info["id"],
-                    lora_local_path=adapter_info["path"],
+                    lora_local_path=lora_path,
                 )
             )
             if not ok:
@@ -1818,27 +2685,42 @@ class CoExTrainer(BaseTrainer):
                     print(f"  >> [Warning] Adapter info for '{adapter}' not found in lora_modules.")
                     continue
 
-                self.model.set_adapter(adapter)
-                self.enable_all_lora_grads(self.model)
-                adapter_path = adapter_info["path"]
-                
+                optimizer_step = int(getattr(self.state, "global_step", 0)) + 1
+                sync_before = None
+                if (
+                    self._is_main_lora_logging_process()
+                    and self._should_log_lora_integrity(optimizer_step)
+                ):
+                    sync_before = self._collect_lora_integrity([adapter])
+                    self._print_lora_integrity(
+                        "pre_vllm_sync", optimizer_step, sync_before
+                    )
+
                 # DeepSpeed ZeRO-3의 경우 전체 파라미터를 gather
                 with gather_if_zero3(list(self.model.parameters())):
                     if self.accelerator.is_main_process:
                         print(f"  >> [vLLM Sync] Merging Adapter '{adapter}'...")
-                        self.model.save_pretrained(
-                            adapter_path, 
-                            save_adapter=True, 
-                            save_config=True, 
-                            safe_serialization=True
+                        self._save_adapter_for_vllm(
+                            self.model,
+                            adapter_info,
+                            phase="vllm_sync_export",
+                            optimizer_step=optimizer_step,
                         )
-                    print(f"  >> [vLLM Sync] Adapter '{adapter}' saved to '{adapter_path}'.")
+                        print(f"  >> [vLLM Sync] Adapter '{adapter}' saved to '{adapter_info['path']}'.")
                     
                     # Synchronize with barrier for DeepSpeed
                     if zero_stage_3:
                         torch.distributed.barrier()
                 
                 self._reload_lora_in_vllm_colocate(adapter_info)
+                if sync_before is not None:
+                    sync_after = self._collect_lora_integrity([adapter])
+                    self._print_lora_integrity(
+                        "post_vllm_sync",
+                        optimizer_step,
+                        sync_after,
+                        baseline=sync_before,
+                    )
 
         else:
             # Non-PEFT models
@@ -2081,6 +2963,11 @@ class CoExTrainer(BaseTrainer):
                                     self.args.correctness_weight_specialist * generation_batch_per_adapter[adapter_name]["correctness_advantages"] + \
                                     self.args.diversity_weight_specialist * generation_batch_per_adapter[adapter_name]["diversity_advantages"]
 
+                    self._annotate_and_verify_update_semantics(
+                        generation_batch_per_adapter[adapter_name],
+                        adapter_name,
+                    )
+
                     # if adapter_name == "default":
                     #     generation_batch_per_adapter[adapter_name]["advantages"] = generation_batch_per_adapter[adapter_name]["correctness_advantages"]
                     # else:
@@ -2160,6 +3047,7 @@ class CoExTrainer(BaseTrainer):
                     # Get rewards and answer info
                     correctness_rewards = gen_batch.get("correctness_reward_per_sample", [None] * len(completions))
                     answer_info_list = gen_batch.get("answer_info", [None] * len(completions))
+                    source_metadata_list = gen_batch.get("source_trace_metadata", [None] * len(completions))
 
                     # Convert tensors to lists if necessary
                     if advantages is not None:
@@ -2177,9 +3065,11 @@ class CoExTrainer(BaseTrainer):
                     else:
                         correctness_rewards = [None] * len(completions)
 
-                    # Ensure answer_info_list is a list
+                    # Ensure answer_info_list/source_metadata_list are lists
                     if answer_info_list is None:
                         answer_info_list = [None] * len(completions)
+                    if source_metadata_list is None:
+                        source_metadata_list = [None] * len(completions)
 
                     # if adapter_name == "default":
                     #     num_to_save = self.args.num_completion_main_adapter
@@ -2209,8 +3099,8 @@ class CoExTrainer(BaseTrainer):
 
                     import numpy as np
 
-                    for i, (prompt, completion, adv, div_adv, corr_reward, answer_info) in enumerate(
-                        zip(prompts, completions, advantages, diversity_advantages, correctness_rewards, answer_info_list)
+                    for i, (prompt, completion, adv, div_adv, corr_reward, answer_info, source_meta) in enumerate(
+                        zip(prompts, completions, advantages, diversity_advantages, correctness_rewards, answer_info_list, source_metadata_list)
                     ):
                         # Handle completion format
                         if isinstance(completion, list) and len(completion) > 0:
@@ -2226,6 +3116,34 @@ class CoExTrainer(BaseTrainer):
                             "diversity_advantage": float(div_adv) if div_adv is not None and not (isinstance(div_adv, float) and np.isnan(div_adv)) else None,
                             "correctness_reward": float(corr_reward) if corr_reward is not None and not (isinstance(corr_reward, float) and np.isnan(corr_reward)) else None,
                         }
+
+                        if isinstance(source_meta, dict):
+                            entry["source_trace_metadata"] = source_meta
+                            for meta_key in (
+                                "sample_id",
+                                "source_adapter_name",
+                                "requested_source_adapter",
+                                "verified_generation_policy",
+                                "vllm_lora_local_path",
+                                "expected_adapter_manifest",
+                                "exported_adapter_manifest",
+                                "adapter_hash_match",
+                                "planned_update_scope",
+                                "planned_advantage_source",
+                                "planned_advantage_source_verified",
+                                "expected_update_scope",
+                                "update_scope",
+                                "update_scope_ok",
+                                "source_owned_update_required",
+                                "source_owned_update_ok",
+                                "raw_source_owned_update_ok",
+                                "advantage_source",
+                                "advantage_source_verified",
+                            ):
+                                if meta_key in source_meta:
+                                    entry[meta_key] = source_meta[meta_key]
+                        else:
+                            entry["source_trace_metadata"] = None
 
                         # Add answer info if available
                         if answer_info is not None and isinstance(answer_info, dict):
@@ -2303,7 +3221,7 @@ class CoExTrainer(BaseTrainer):
         forward_kwargs = forward_kwargs or {}
 
         # switch adapter
-        self.model.set_adapter(adapter_name)
+        self._set_adapter_with_logging(self.model, adapter_name, "policy_repulsion_score")
         self.enable_all_lora_grads(self.model)
         
         # breakpoint()
@@ -2868,7 +3786,12 @@ class CoExTrainer(BaseTrainer):
                             lora_int_id = adapter_info["id"],
                             lora_local_path = adapter_info["path"],
                         )
-                        print(f"  >> Using LoRA adapter in vLLM x: {adapter_name} (id: {adapter_info['id']})")
+                        hash_status = self._vllm_lora_hash_results.get(adapter_name, {})
+                        print(
+                            f"  >> Using LoRA adapter in vLLM x: {adapter_name} "
+                            f"(id: {adapter_info['id']}, path: {adapter_info['path']}, "
+                            f"hash_status: {hash_status.get('status', 'UNVERIFIED')})"
+                        )
 
                 if self.vllm_tensor_parallel_size > 1:
                     # Gather prompts from all ranks in the TP group and flatten.
@@ -2982,7 +3905,7 @@ class CoExTrainer(BaseTrainer):
                 if self.args.cast_lm_head_to_fp32:
                     unwrapped_model.lm_head.to(torch.float32)
                 with torch.inference_mode():
-                    unwrapped_model.set_adapter(adapter_name)
+                    self._set_adapter_with_logging(unwrapped_model, adapter_name, "transformers_paged_generate")
                     self.enable_all_lora_grads(unwrapped_model)
                     # Continuous batching API expects 'inputs' arg only
                     all_outputs = unwrapped_model.generate_batch(
@@ -3025,7 +3948,7 @@ class CoExTrainer(BaseTrainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
-                unwrapped_model.set_adapter(adapter_name)
+                self._set_adapter_with_logging(unwrapped_model, adapter_name, "transformers_generate")
                 self.enable_all_lora_grads(unwrapped_model)
                 prompt_completion_ids = unwrapped_model.generate(
                     **generate_inputs, generation_config=self.generation_config, disable_compile=True
@@ -3439,6 +4362,7 @@ class CoExTrainer(BaseTrainer):
         final_completion_ids_list = [None] * total_items
         final_sampling_per_token_logps_list = [None] * total_items
         final_num_items_in_batch = [None] * total_items
+        final_source_trace_metadata = [None] * total_items
 
         if self.use_vllm and self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
             self.check_for_vllm_wake()
@@ -3496,13 +4420,25 @@ class CoExTrainer(BaseTrainer):
             
             # 4. [중요] 생성된 결과를 원래 인덱스 위치(indices)에 매핑하여 저장
             # sub_results는 0부터 순서대로 나오지만, 실제 위치는 indices[k] 입니다.
+            source_adapter_idx = self.all_adapter_names.index(adapter_name)
             for local_idx, original_idx in enumerate(indices):
                 # breakpoint()
                 final_prompt_ids_list[original_idx] = sub_prompt_ids[local_idx]
                 final_completion_ids_list[original_idx] = sub_completion_ids[local_idx]
+                local_sampling_logps = None
                 if sub_logps is not None:
-                    final_sampling_per_token_logps_list[original_idx] = sub_logps[local_idx]
+                    local_sampling_logps = sub_logps[local_idx]
+                    final_sampling_per_token_logps_list[original_idx] = local_sampling_logps
                 final_num_items_in_batch[original_idx] = sub_num_items.item()
+                final_source_trace_metadata[original_idx] = self._build_source_trace_metadata(
+                    inputs[original_idx],
+                    adapter_name,
+                    source_adapter_idx,
+                    original_idx,
+                    local_idx,
+                    sub_completion_ids[local_idx],
+                    local_sampling_logps,
+                )
                 # breakpoint()
                 """
                 (Pdb) final_num_items_in_batch
@@ -3606,6 +4542,7 @@ class CoExTrainer(BaseTrainer):
             "batch_size": batch_size,
             "num_images": num_images,
             "sampling_per_token_logps": sampling_per_token_logps,
+            "source_trace_metadata": final_source_trace_metadata,
             "prompts_text": prompts_text,
             "completions_text": completions_text,
             "images": images,
@@ -3617,6 +4554,7 @@ class CoExTrainer(BaseTrainer):
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "num_items_in_batch": num_items_in_batch,
+            "source_trace_metadata": final_source_trace_metadata,
         }
         # breakpoint()
         output_per_adapter = {}
@@ -3677,6 +4615,7 @@ class CoExTrainer(BaseTrainer):
         num_images = pass_data["num_images"]
         # sampling_per_token_logps = pass_data["sampling_per_token_logps"]
         sampling_per_token_logps = pass_data.get("sampling_per_token_logps", None)
+        source_trace_metadata = pass_data.get("source_trace_metadata", None)
         prompts_text = pass_data["prompts_text"]
         completions_text = pass_data["completions_text"]
         images = pass_data["images"]
@@ -3691,7 +4630,7 @@ class CoExTrainer(BaseTrainer):
         # breakpoint()
 
         with torch.no_grad():
-            self.model.set_adapter(adapter_name)
+            self._set_adapter_with_logging(self.model, adapter_name, "correctness_score")
             self.enable_all_lora_grads(self.model)
             # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
             # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
@@ -3921,6 +4860,14 @@ class CoExTrainer(BaseTrainer):
         #         nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
         #     )
 
+        if source_trace_metadata is not None:
+            corr_values = local_rewards.detach().float().cpu().tolist()
+            corr_adv_values = advantages.detach().float().cpu().tolist()
+            for idx, record in enumerate(source_trace_metadata):
+                if isinstance(record, dict):
+                    record["correctness_reward"] = corr_values[idx] if idx < len(corr_values) else None
+                    record["correctness_advantage"] = corr_adv_values[idx] if idx < len(corr_adv_values) else None
+
         if self.use_vllm and use_importance_weighting and importance_sampling_ratio is not None:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
             delta = delta[completion_mask.bool()]
@@ -3959,6 +4906,7 @@ class CoExTrainer(BaseTrainer):
             "correctness_reward_per_sample": local_rewards,
             "raw_rewards": local_rewards,
             "answer_info": local_answer_info,
+            "source_trace_metadata": source_trace_metadata,
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -4124,6 +5072,7 @@ class CoExTrainer(BaseTrainer):
         )
         all_process_advantages = advantages.clone()
         advantages = advantages[process_slice]
+        local_rewards = rewards[process_slice]
 
         # metrics/logs
         for i, name in enumerate(diversity_reward_names):
@@ -4167,6 +5116,16 @@ class CoExTrainer(BaseTrainer):
             self._logs[f"{adapter_name}/diversity_rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs[f"{adapter_name}/diversity_advantages"].extend(all_process_advantages.tolist())
 
+        source_trace_metadata = generation_batch.get("source_trace_metadata", None)
+        if source_trace_metadata is not None:
+            div_values = local_rewards.detach().float().cpu().tolist()
+            div_adv_values = advantages.detach().float().cpu().tolist()
+            for idx, record in enumerate(source_trace_metadata):
+                if isinstance(record, dict):
+                    record["diversity_reward"] = div_values[idx] if idx < len(div_values) else None
+                    record["diversity_advantage"] = div_adv_values[idx] if idx < len(div_adv_values) else None
+
+        generation_batch["diversity_reward_per_sample"] = local_rewards
         generation_batch["diversity_advantages"] = advantages
         return generation_batch
 
@@ -4921,6 +5880,7 @@ class CoExTrainer(BaseTrainer):
         # The exception is when using vLLM, where we always compute old_per_token_logps
         # for importance sampling
         old_per_token_logps = inputs.get("old_per_token_logps")
+        old_was_provided = old_per_token_logps is not None
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
         log_ratio = per_token_logps - old_per_token_logps
@@ -5098,6 +6058,20 @@ class CoExTrainer(BaseTrainer):
 
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode][f"{adapter_name}/clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+
+        self._emit_ratio_trace_and_metadata(
+            inputs=inputs,
+            adapter_name=adapter_name,
+            per_token_logps=per_token_logps,
+            old_per_token_logps=old_per_token_logps,
+            old_was_provided=old_was_provided,
+            log_ratio=log_ratio,
+            ratio=coef_1,
+            clip_mask=is_region_clipped,
+            advantages=advantages,
+            completion_mask=completion_mask,
+            loss=loss,
+        )
 
         return loss
 
