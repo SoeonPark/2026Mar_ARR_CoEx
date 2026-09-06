@@ -62,6 +62,8 @@ def correctness_reward_func(prompts: list[str], completions: list[str], solution
             "extracted_answer": None,
             "gold_answer": None,
             "is_correct": False,
+            "answer_correct": False,
+            "answer_correct_float": 0.0,
             "has_think_tag": False,
         }
 
@@ -102,19 +104,39 @@ def correctness_reward_func(prompts: list[str], completions: list[str], solution
                 answer_correct = False
         else:
             print(f"  >> Failed to parse gold solution: {sol}")
+            # Gold parsing failed, so we cannot verify the answer at all. The
+            # legacy reward of 1.0 is kept for backward compatibility, but
+            # `is_correct`/`answer_correct` must NOT claim the model was
+            # correct -- there is nothing here to verify against.
+            info["is_correct"] = False
+            info["answer_correct"] = False
+            info["answer_correct_float"] = 0.0
+            info["answer_reward"] = 1.0
+            info["think_reward"] = 0.0
+            info["final_reward"] = 1.0
             rewards.append(1.0)
-            info["is_correct"] = True
             answer_info.append(info)
             continue
 
-        if answer_correct:
-            reward = 1.0
+        answer_reward = 1.0 if answer_correct else 0.0
+        reward = answer_reward
 
         has_think_tag = content.count("</think>") == 1
         info["has_think_tag"] = has_think_tag
 
-        if has_think_tag:
-            reward += 0.5
+        think_reward = 0.5 if has_think_tag else 0.0
+        reward += think_reward
+
+        # Pure answer correctness, independent of think/format bonuses. This
+        # is the only field that should ever be used for correctness gating
+        # or for verifier-observable correctness rewards such as
+        # main_weak_correctness_bonus -- never threshold `reward`/`final_reward`.
+        info["is_correct"] = bool(answer_correct)
+        info["answer_correct"] = bool(answer_correct)
+        info["answer_correct_float"] = 1.0 if answer_correct else 0.0
+        info["answer_reward"] = answer_reward
+        info["think_reward"] = think_reward
+        info["final_reward"] = reward
 
         rewards.append(reward)
         answer_info.append(info)

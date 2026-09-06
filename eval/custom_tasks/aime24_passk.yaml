@@ -1,0 +1,50 @@
+task: aime24_passk
+dataset_path: Maxwell-Jia/AIME_2024
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: train
+doc_to_text: "Question: {{Problem}}\nAnswer:"
+doc_to_target: "{{Answer}}"
+process_results: !function utils.process_results_pass_at_k
+metric_list:
+  - metric: pass@1
+    aggregation: mean
+    higher_is_better: true
+  - metric: pass@2
+    aggregation: mean
+    higher_is_better: true
+  - metric: pass@4
+    aggregation: mean
+    higher_is_better: true
+  - metric: pass@8
+    aggregation: mean
+    higher_is_better: true
+  - metric: pass@16
+    aggregation: mean
+    higher_is_better: true
+  - metric: pass@32
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+    - "<|eot_id|>"
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  max_gen_toks: 32768
+repeats: 32
+filter_list:
+  - name: pass32
+    filter:
+      - function: take_first_k
+        k: 32
+num_fewshot: 0
+metadata:
+  version: 1.0
+  sampling_k: 32
+  generations_per_prompt: 32
+  reported_pass_k: [1, 2, 4, 8, 16, 32]

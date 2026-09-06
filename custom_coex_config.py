@@ -283,7 +283,58 @@ class CoExConfig(TrainingArguments):
         metadata={
             "help": "Comparison pool for diversity rewards: 'intra_adapter' compares only within the same diversity "
             "adapter rollout group, excluding the current rollout; 'all_other' compares against all candidates except "
-            "the source adapter's own rollouts."
+            "the source adapter's own rollouts.",
+        },
+    )
+    diversity_bleu_balance_mode: str = field(
+        default="sample_balanced",
+        metadata={
+            "help": "Averaging mode for 1-BLEU diversity reward when diversity_comparison_scope='all_other'. "
+            "'sample_balanced': every reference completion receives equal weight (simple average over all N_m + (K-1)*N_d "
+            "references). 'source_balanced': compute per-source average similarity first, then combine with "
+            "diversity_source_main_weight, making the reward independent of rollout allocation size."
+        },
+    )
+    diversity_source_main_weight: float = field(
+        default=0.5,
+        metadata={
+            "help": "alpha_m in [0, 1] for source-balanced 1-BLEU diversity reward. Controls how strongly the "
+            "diversity policy is encouraged to differ from the main/default policy. 0.5 weights main and other "
+            "diversity sources equally; 0.6 is recommended when inference uses only the main policy."
+            "Only used when diversity_bleu_balance_mode='source_balanced'."
+        },
+    )
+    diversity_bleu_exclude_self: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to exclude a sample from comparing against itself in 1-BLEU diversity reward. "
+            "Applies to both BLEU and trace-Jaccard rewards. In all_other scope this is a no-op since the "
+            "source adapter's completions are never in the reference pool. In intra_adapter scope this "
+            "prevents inflated self-similarity pulling down the reward."
+        },
+    )
+    diversity_reward_debug: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, log detailed per-adapter diversity reward diagnostics (reference pool sizes, "
+            "balance mode, reward statistics, source component similarities) every "
+            "diversity_reward_debug_steps optimization steps."
+        },
+    )
+    diversity_reward_debug_steps: int = field(
+        default=20,
+        metadata={
+            "help": "Emit detailed diversity reward debug logs every N optimization steps when "
+            "diversity_reward_debug=True."
+        },
+    )
+    diversity_bleu_text_scope: str = field(
+        default="full_completion",
+        metadata={
+            "help": "Text extraction scope for 1-BLEU diversity reward. "
+            "'full_completion': BLEU over the entire completion text (default). "
+            "'reasoning_only': BLEU over <think>...</think> blocks only. "
+            "'answer_only': BLEU over the final answer portion only."
         },
     )
     mini_batch_size: int = field(
@@ -313,7 +364,34 @@ class CoExConfig(TrainingArguments):
     )
     adapter_sanity_check_steps: int = field(
         default=10,
-        metadata={"help": "Recheck adapter norms and switch stability every N optimizer steps. Set to 0 to disable."},
+        metadata={
+            "help": "Log detailed per-adapter LoRA norms, gradients, optimizer membership, and optimizer-step deltas "
+            "every N optimizer steps (the first step is always logged). Set to 0 to disable detailed checks."
+        },
+    )
+    log_adapter_switches: bool = field(
+        default=True,
+        metadata={"help": "Log every explicit PEFT adapter switch without changing adapter behavior."},
+    )
+    vllm_lora_hash_check: bool = field(
+        default=False,
+        metadata={"help": "After each vLLM LoRA export, compare training-side adapter tensors with the exported safetensors by SHA-256."},
+    )
+    vllm_lora_hash_check_interval: int = field(
+        default=1,
+        metadata={"help": "Run vLLM LoRA tensor hash checks every N optimizer steps when vllm_lora_hash_check is enabled."},
+    )
+    vllm_lora_hash_check_strict: bool = field(
+        default=True,
+        metadata={"help": "Raise immediately if a vLLM LoRA export hash check fails."},
+    )
+    source_owned_trace: bool = field(
+        default=False,
+        metadata={"help": "Log ratio/source-policy invariants and write response-level source-owned update metadata."},
+    )
+    source_owned_trace_log_steps: int = field(
+        default=1,
+        metadata={"help": "Emit source-owned ratio trace logs every N optimizer steps when source_owned_trace is enabled."},
     )
 
     # Parameters whose default values are overridden from TrainingArguments
@@ -786,7 +864,7 @@ class CoExConfig(TrainingArguments):
     # Settings for Distribution Repulsion
     diversity_reward_type: str = field(
         default="external",
-        metadata={"help": "external|one_minus_bleu|one_minus_bleu_score|1-bleu|trace_jaccard|trace_jaccard3|policy_repulsion_margin|policy_repulsion_margin_barrier"},
+        metadata={"help": "external|one_minus_bleu|one_minus_bleu_score|1-bleu|trace_jaccard|trace_jaccard3|policy_repulsion_margin|policy_repulsion_margin_barrier|main_weak_correctness_bonus"},
     )
     trace_jaccard_ngram_size: int = field(
         default=3,
@@ -841,6 +919,31 @@ class CoExConfig(TrainingArguments):
         metadata={"help": "If >0, use soft barrier with softplus temperature tau; else hard ReLU barrier."},
     )
 
+    # Settings for main_weak_correctness_bonus
+    main_weak_correctness_bonus_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Multiplier applied to the raw main_weak_correctness_bonus reward "
+            "(c(x,y) * (1 - main_correct_rate(x))) before it is group-normalized into "
+            "diversity_advantages. Only used when diversity_reward_type='main_weak_correctness_bonus'. "
+            "Note: the *effective* coefficient on the final advantage is "
+            "diversity_weight_specialist * main_weak_correctness_bonus_weight, since "
+            "diversity_weight_specialist is applied again after normalization."
+        },
+    )
+    main_weak_correctness_bonus_log_by_source: bool = field(
+        default=True,
+        metadata={"help": "If True, emit per-diversity-source main_weak_correctness_bonus metrics."},
+    )
+    main_weak_correctness_bonus_use_answer_correct_only: bool = field(
+        default=True,
+        metadata={
+            "help": "If True (recommended, only supported value for now), main_weak_correctness_bonus uses the "
+            "pure answer_correct_float field rather than the mixed correctness_reward scalar for both c(x,y) and "
+            "main_correct_rate(x)."
+        },
+    )
+
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
@@ -856,8 +959,28 @@ class CoExConfig(TrainingArguments):
             raise ValueError("memory_profile_interval must be positive")
         if self.adapter_sanity_check_steps < 0:
             raise ValueError("adapter_sanity_check_steps must be non-negative")
+        if self.vllm_lora_hash_check_interval <= 0:
+            raise ValueError("vllm_lora_hash_check_interval must be positive")
+        if self.source_owned_trace_log_steps <= 0:
+            raise ValueError("source_owned_trace_log_steps must be positive")
         if self.diversity_comparison_scope not in {"intra_adapter", "all_other"}:
             raise ValueError("diversity_comparison_scope must be one of {'intra_adapter', 'all_other'}")
+        if self.diversity_bleu_balance_mode not in {"sample_balanced", "source_balanced"}:
+            raise ValueError(
+                "diversity_bleu_balance_mode must be one of {'sample_balanced', 'source_balanced'}, "
+                f"got {self.diversity_bleu_balance_mode!r}"
+            )
+        if not (0.0 <= self.diversity_source_main_weight <= 1.0):
+            raise ValueError(
+                f"diversity_source_main_weight must be in [0.0, 1.0], got {self.diversity_source_main_weight}"
+            )
+        if self.diversity_reward_debug_steps <= 0:
+            raise ValueError("diversity_reward_debug_steps must be positive")
+        if self.diversity_bleu_text_scope not in {"full_completion", "reasoning_only", "answer_only"}:
+            raise ValueError(
+                "diversity_bleu_text_scope must be one of {'full_completion', 'reasoning_only', 'answer_only'}, "
+                f"got {self.diversity_bleu_text_scope!r}"
+            )
         valid_diversity_reward_types = {
             "external",
             "one_minus_bleu",
@@ -867,6 +990,7 @@ class CoExConfig(TrainingArguments):
             "trace_jaccard3",
             "policy_repulsion_margin",
             "policy_repulsion_margin_barrier",
+            "main_weak_correctness_bonus",
         }
         if self.diversity_reward_type not in valid_diversity_reward_types:
             raise ValueError(

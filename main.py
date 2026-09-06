@@ -1,7 +1,6 @@
 # ./train/train.py
+import gc
 import os
-import subprocess
-import wandb
 import sys
 sys.set_int_max_str_digits(0)
 import importlib.util
@@ -23,6 +22,7 @@ from rewards import (
     bert_score,
     bleu_score,
     one_minus_bleu_score,
+    trace_jaccard_diversity_reward,
     correctness_reward_func_rule
 )
 from data_utils import (
@@ -54,7 +54,13 @@ def build_experiment_name(args, coex_config) -> str:
     model_short = model_short.replace('deepseek-r1-distill-', '').replace('meta-llama-', '').replace('llama-', '')
     
     # Method tag
-    if coex_config.num_diversity_adapters > 0:
+    if coex_config.loss_type in {"dmpo", "pure_dmpo"}:
+        method_tag = (
+            f"{coex_config.loss_type}_singleSource_G{coex_config.num_generations}"
+            f"_beta{coex_config.dmpo_beta:g}_temp{coex_config.dmpo_temperature:.4g}"
+            f"_base{coex_config.dmpo_base_loss_type}"
+        )
+    elif coex_config.num_diversity_adapters > 0:
             ablation_tag = ""
             if coex_config.no_div:
                 ablation_tag = "_noDiv"
@@ -80,25 +86,75 @@ def build_experiment_name(args, coex_config) -> str:
     else:
         return f"{method_tag}_{model_short}-num_gens{total_gens}-diversityRewardType{coex_config.diversity_reward_type}-r_{LORA_R}-alpha_{LORA_ALPHA}-dropout_{LORA_DROPOUT}-{timestamp}"
 
-from functools import wraps
-
-def attach_set_adapter_callback(model, callback):
-    """
-    Wrap model.set_adapter(adapter_names) so that callback(model, adapter_names)
-    is called after every set_adapter().
-    """
-    orig = model.set_adapter  # bound method
-
-    @wraps(orig)
-    def wrapped(adapter_names, *args, **kwargs):
-        out = orig(adapter_names, *args, **kwargs)
-        callback(model, adapter_names)
-        return out
-
-    model.set_adapter = wrapped
-    return model
-
 from torch.distributed.elastic.multiprocessing.errors import record
+
+
+def cleanup_colocated_vllm(trainer) -> None:
+    """Release a colocated vLLM engine while CUDA is still fully alive."""
+    if not (
+        getattr(trainer, "use_vllm", False)
+        and getattr(trainer, "vllm_mode", None) == "colocate"
+        and getattr(trainer, "llm", None) is not None
+    ):
+        return
+
+    print("[vLLM Cleanup] Starting colocated engine cleanup")
+    if getattr(trainer, "_vllm_slept", False):
+        trainer.check_for_vllm_wake()
+
+    llm = trainer.llm
+    engine = getattr(llm, "llm_engine", None)
+    executor = getattr(engine, "model_executor", None)
+    driver_wrapper = getattr(executor, "driver_worker", None)
+    worker = getattr(driver_wrapper, "worker", None)
+
+    if driver_wrapper is not None:
+        driver_wrapper.worker = None
+    if executor is not None:
+        executor.driver_worker = None
+    if engine is not None:
+        engine.model_executor = None
+    trainer.llm = None
+
+    del worker
+    del driver_wrapper
+    del executor
+    del engine
+    del llm
+    gc.collect()
+
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    allocator = CuMemAllocator.instance
+    if allocator is not None:
+        live_allocations = len(allocator.pointer_to_data)
+        pool_entries = list(allocator.allocator_and_pools.values())
+        allocator.allocator_and_pools.clear()
+        print(
+            "[vLLM Cleanup] "
+            f"live_allocations={live_allocations} "
+            f"memory_pools={len(pool_entries)}"
+        )
+        while pool_entries:
+            mem_pool, pluggable_allocator = pool_entries.pop()
+            del mem_pool
+            del pluggable_allocator
+        CuMemAllocator.instance = None
+        del allocator
+        gc.collect()
+
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+    )
+
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[vLLM Cleanup] Completed colocated engine cleanup")
+
 
 @record
 def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> None:
@@ -125,11 +181,16 @@ def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> No
     #     llm_int8_enable_fp32_cpu_offload=False
     # )
 
+    compute_dtype = (
+        torch.bfloat16
+        if coex_config.bf16 and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        bnb_4bit_compute_dtype=compute_dtype,
     )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -144,7 +205,7 @@ def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> No
         config=cfg,
         quantization_config=bnb_config,
         trust_remote_code=model_config.trust_remote_code, # True, False
-        torch_dtype=torch.float16,
+        torch_dtype=compute_dtype,
         attn_implementation=attn_impl,
         # device_map="auto", 
         # device_map={"": torch.cuda.current_device()},
@@ -174,35 +235,22 @@ def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> No
     )
     
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=coex_config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+    )
     model = get_peft_model(model, peft_config)
-
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
     for i in range(coex_config.num_diversity_adapters):
         model.add_adapter(f"diversity_{i}", peft_config=peft_config)
         print(f"  >> Added adapter diversity__{i}")
     print(model)
     
-    def force_enable_all_lora_grads(model, adapter_names=None):
-        for n, p in model.named_parameters():
-            if "lora" in n:
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
-
-    attach_set_adapter_callback(model, force_enable_all_lora_grads)
-    
     model.set_adapter("default")
     
-    print(f"  >> Total trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    
-    for i,j in model.named_parameters(): 
-        print(f"{i}: {j.numel()} - requires_grad: {j.requires_grad}")
-
-    # WandB setup
-    wandb_project = f"CoEx-{args.model_path.split('/')[-1]}"
-    wandb.init(project=wandb_project, name=args.experiment_name)
+    print("  >> Active adapter: default")
+    print(f"  >> Active-adapter trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path, 
@@ -215,13 +263,28 @@ def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> No
 
     print("has chat_template:", getattr(tokenizer, "chat_template", None) is not None)
 
+    diversity_reward_type = coex_config.diversity_reward_type
+    if diversity_reward_type in {"trace_jaccard", "trace_jaccard3"}:
+        diversity_reward_funcs = [trace_jaccard_diversity_reward]
+    elif diversity_reward_type in {"one_minus_bleu", "one_minus_bleu_score", "1-bleu", "external"}:
+        diversity_reward_funcs = [one_minus_bleu_score]
+    elif diversity_reward_type in {"policy_repulsion_margin", "policy_repulsion_margin_barrier"}:
+        # Policy-repulsion modes compute their reward inside CoExTrainer.
+        diversity_reward_funcs = []
+    elif diversity_reward_type == "main_weak_correctness_bonus":
+        # main_weak_correctness_bonus is computed inside CoExTrainer using the
+        # already-scored default-adapter correctness, not an external reward_func.
+        diversity_reward_funcs = []
+    else:
+        raise ValueError(f"Unknown diversity_reward_type: {diversity_reward_type}")
+
     trainer = CoExTrainer(
         args=coex_config,
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
         reward_funcs_correctness=[correctness_reward_func],
-        reward_funcs_diversity=[one_minus_bleu_score],
+        reward_funcs_diversity=diversity_reward_funcs,
         completion_store_path=f"completion_storage/{args.experiment_name}",
         trainer_output=f"trainer_output/{args.experiment_name}",
     )
@@ -230,18 +293,30 @@ def main(coex_config, model_config, args, use_vllm: Optional[bool] = True) -> No
     print("is_gradient_checkpointing:", getattr(m, "is_gradient_checkpointing", None))
     print("_gradient_checkpointing_kwargs:", getattr(m, "_gradient_checkpointing_kwargs", None))
 
-    trainer.train()
+    try:
+        trainer.train()
 
-    final_checkpoint = os.path.join(f"trainer_output/{args.experiment_name}", f"final_checkpoint_default")
-    model.set_adapter("default")
-    model.save_pretrained(final_checkpoint)
-    print(f"[DONE] Final model saved to: {final_checkpoint}")
-    
-    for i in range(coex_config.num_diversity_adapters):
-        adapter_checkpoint = os.path.join(f"trainer_output/{args.experiment_name}", f"final_checkpoint_diversity_{i}")
-        model.set_adapter(f"diversity_{i}")
-        model.save_pretrained(adapter_checkpoint)
-        print(f"[DONE] Diversity adapter {i} saved to: {adapter_checkpoint}")
+        final_checkpoint = os.path.join(
+            f"trainer_output/{args.experiment_name}",
+            "final_checkpoint_default",
+        )
+        model.set_adapter("default")
+        model.save_pretrained(final_checkpoint)
+        print(f"[DONE] Final model saved to: {final_checkpoint}")
+
+        for i in range(coex_config.num_diversity_adapters):
+            adapter_checkpoint = os.path.join(
+                f"trainer_output/{args.experiment_name}",
+                f"final_checkpoint_diversity_{i}",
+            )
+            model.set_adapter(f"diversity_{i}")
+            model.save_pretrained(adapter_checkpoint)
+            print(
+                f"[DONE] Diversity adapter {i} saved to: "
+                f"{adapter_checkpoint}"
+            )
+    finally:
+        cleanup_colocated_vllm(trainer)
 
 @dataclass
 class CustomArgument:
@@ -269,11 +344,19 @@ class CustomArgument:
     )
     diversity_reward_funcs: List[str] = field(
         default_factory=lambda: ["bleu"],
-        metadata={"help": "Diversity reward functions (comma-separated): bleu, bert, levenshtein"}
+        metadata={"help": "External diversity reward labels; diversity_reward_type selects trainer-native rewards."}
     )
     wandb_project: str = field(
         default="auto",
         metadata={"help": "WandB project name. Use 'auto' for automatic naming."}
+    )
+    wandb_entity: str = field(
+        default="none",
+        metadata={"help": "WandB entity/team name. Use none to omit it."}
+    )
+    wandb_mode: str = field(
+        default="offline",
+        metadata={"help": "WandB mode: online, offline, or disabled."}
     )
 
     
@@ -291,7 +374,19 @@ if __name__ == "__main__":
     else:
         wandb_project = args.wandb_project
     
-    wandb.init(project=wandb_project, name=args.experiment_name)
+    if args.wandb_mode not in {"online", "offline", "disabled"}:
+        raise ValueError("wandb_mode must be one of: online, offline, disabled")
+
+    wandb_entity = None if args.wandb_entity.lower() == "none" else args.wandb_entity
+    os.environ["WANDB_MODE"] = args.wandb_mode
+    os.environ["WANDB_PROJECT"] = wandb_project
+    if wandb_entity is None:
+        os.environ.pop("WANDB_ENTITY", None)
+    else:
+        os.environ["WANDB_ENTITY"] = wandb_entity
+
+    coex_config.run_name = args.experiment_name
+    coex_config.report_to = [] if args.wandb_mode == "disabled" else ["wandb"]
 
     coex_config.num_generations = (
         coex_config.num_completion_main_adapter + 
@@ -303,5 +398,30 @@ if __name__ == "__main__":
     print(f"  >> num_generations: {coex_config.num_generations}")
     print(f"  >> per_device_train_batch_size: {coex_config.per_device_train_batch_size}")
     print(f"  >> generation_batch_size: {coex_config.generation_batch_size}")
-        
+    print(f"  >> loss_type: {coex_config.loss_type}")
+    print(f"  >> dmpo_base_loss_type: {coex_config.dmpo_base_loss_type}")
+    print(f"  >> dmpo_beta: {coex_config.dmpo_beta}")
+    print(f"  >> dmpo_temperature: {coex_config.dmpo_temperature}")
+    print(f"  >> dmpo_skip_zero_advantage_groups: {coex_config.dmpo_skip_zero_advantage_groups}")
+    print(f"  >> dmpo_candidate_scope: {coex_config.dmpo_candidate_scope}")
+
+    if coex_config.loss_type in {"dmpo", "pure_dmpo"}:
+        source_mixed_rollouts = (
+            coex_config.num_diversity_adapters
+            * coex_config.num_completion_per_diversity_adapter
+            != 0
+        )
+        if coex_config.dmpo_candidate_scope == "collective":
+            print(
+                "  >> DMPO candidate scope: collective CoEx-DM mode "
+                "(source-mixed rollout group)."
+            )
+        elif coex_config.dmpo_candidate_scope == "main_only" and source_mixed_rollouts:
+            raise ValueError(
+                "Faithful DMPO main_only baseline must not use source-mixed rollouts: "
+                f"num_diversity_adapters={coex_config.num_diversity_adapters}, "
+                f"num_completion_per_diversity_adapter={coex_config.num_completion_per_diversity_adapter}. "
+                "Use dmpo_candidate_scope=collective for the explicit CoEx-DM 4/3/3 mode."
+            )
+
     main(coex_config, model_config, args, use_vllm=coex_config.use_vllm)

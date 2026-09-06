@@ -73,6 +73,13 @@ from trl.trainer.base_trainer import BaseTrainer
 from trl.trainer.callbacks import SyncRefModelCallback
 from custom_coex_config import CoExConfig
 from rewards.diversity import trace_jaccard_diversity_reward
+from rewards.diversity import compute_one_minus_bleu_rewards_for_adapter, trace_jaccard_diversity_reward
+from rewards.main_weak_correctness import (
+    align_main_correct_rate_to_local_rows,
+    compute_group_coverage_stats,
+    compute_main_correct_rate_by_prompt,
+    compute_main_weak_correctness_bonus,
+)
 from trl.trainer.utils import (
     RepeatSampler,
     disable_dropout_in_model,
@@ -279,6 +286,7 @@ class CoExTrainer(BaseTrainer):
     }
     _TRACE_JACCARD_REWARD_TYPES = {"trace_jaccard", "trace_jaccard3"}
     _ONE_MINUS_BLEU_REWARD_TYPES = {"one_minus_bleu", "one_minus_bleu_score", "1-bleu"}
+    _MAIN_WEAK_CORRECTNESS_REWARD_TYPES = {"main_weak_correctness_bonus"}
     _paper = {
         "title": "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
         "id": "2402.03300",
@@ -1481,6 +1489,18 @@ class CoExTrainer(BaseTrainer):
             "sampling_logprob_mean": self._mean_float(sampling_logps),
             "completion_length": len(completion_ids),
             "completion_mask_sum": len(completion_ids),
+            # Populated by correctness/diversity scoring below; defaulted here
+            # so every record -- including main/default rows, which never go
+            # through _score_completions_diversity -- has these keys present
+            # for easy diagnostics rather than silently missing.
+            "is_correct": None,
+            "answer_correct": None,
+            "answer_correct_float": None,
+            "main_correct_rate": None,
+            "main_weak_factor": None,
+            "main_weak_correctness_bonus": 0.0,
+            "aux_correct_advantage": None,
+            "main_weak_correctness_advantage": 0.0,
         }
 
     def _row_masked_mean_list(self, values: torch.Tensor | None, mask: torch.Tensor) -> list[float | None]:
@@ -2898,6 +2918,22 @@ class CoExTrainer(BaseTrainer):
                                                                                                     adapter_to_indices[adapter_name])
                     if adapter_name == "default":
                         generation_batch_per_adapter[adapter_name]["advantages"] = generation_batch_per_adapter[adapter_name]["correctness_advantages"]
+
+                        # main_correct_rate(x) per prompt, from PURE answer correctness
+                        # only (never the mixed correctness_reward scalar). default's own
+                        # correctness pass above already scored the FULL rollout pool
+                        # (current_num_completions == self.num_generations), so every row's
+                        # answer_correct_float/prompt_index/source_adapter_name is already
+                        # populated in source_trace_metadata at this point -- this filters
+                        # down to "default"-sourced rows only, robust to any number of
+                        # diversity adapters and to multi-prompt batches.
+                        main_correct_rate_by_prompt = compute_main_correct_rate_by_prompt(
+                            generation_batch_per_adapter[adapter_name]["source_trace_metadata"]
+                        )
+                        self._log_main_correct_rate_and_group_coverage(
+                            generation_batch_per_adapter[adapter_name]["source_trace_metadata"],
+                            main_correct_rate_by_prompt,
+                        )
                     else:
                         # no_div 모드: diversity adapter도 correctness만으로 학습
                         if self.args.no_div:
@@ -2914,21 +2950,51 @@ class CoExTrainer(BaseTrainer):
                             source_index_set = set(source_indices)
                             if self.diversity_comparison_scope == "intra_adapter":
                                 comparison_indices = source_indices
+                            # pass_data_per_adapter["default"] holds all completions across
+                            # every adapter (it is never sliced — see _generate_completions).
+                            all_pass_data = pass_data_per_adapter["default"]
+                            source_indices = list(adapter_to_indices[adapter_name])
+                            source_index_set = set(source_indices)
+
+                            index_to_adapter = {}
+                            for rollout_adapter, rollout_indices in adapter_to_indices.items():
+                                for index in rollout_indices:
+                                    index_to_adapter[index] = rollout_adapter
+
+                            if self.diversity_comparison_scope == "intra_adapter":
+                                comparison_indices = source_indices
+                                # Reference group = the adapter's own completions (self-exclusion
+                                # is handled inside the reward helper per exclude_self flag).
+                                reference_groups = {
+                                    adapter_name: [
+                                        all_pass_data["completions"][i] for i in source_indices
+                                    ]
+                                }
+                                source_group_name = adapter_name
                             elif self.diversity_comparison_scope == "all_other":
                                 comparison_indices = [
                                     index
                                     for index in range(len(all_pass_data["completions"]))
                                     if index not in source_index_set
                                 ]
+                                # Build per-source reference groups: main/default + every other
+                                # diversity adapter, each keyed by adapter name.
+                                reference_groups = {}
+                                for ref_adapter, ref_indices in adapter_to_indices.items():
+                                    if ref_adapter != adapter_name:
+                                        reference_groups[ref_adapter] = [
+                                            all_pass_data["completions"][i] for i in ref_indices
+                                        ]
+                                # source is never in reference_groups → no self-exclusion needed
+                                source_group_name = None
                             else:
                                 raise ValueError(
                                     f"Unknown diversity_comparison_scope: {self.diversity_comparison_scope}"
                                 )
-                            index_to_adapter = {}
+                                index_to_adapter = {}
                             for rollout_adapter, rollout_indices in adapter_to_indices.items():
                                 for index in rollout_indices:
                                     index_to_adapter[index] = rollout_adapter
-
                             other_data = {
                                 key: [all_pass_data[key][index] for index in comparison_indices]
                                 for key in ["prompts", "completions", "completion_ids_list"]
@@ -2940,19 +3006,37 @@ class CoExTrainer(BaseTrainer):
                             other_data["comparison_indices"] = comparison_indices
                             other_data["exclude_self"] = self.diversity_comparison_scope == "intra_adapter"
                             other_data["comparison_scope"] = self.diversity_comparison_scope
+                            # New: structured reference groups for principled BLEU reward
+                            other_data["reference_groups"] = reference_groups
+                            other_data["source_group_name"] = source_group_name
                             
                             generation_batch_per_adapter[adapter_name] = self._score_completions_diversity(
-                                generation_batch_per_adapter[adapter_name], 
-                                pass_data_per_adapter[adapter_name], 
+                                generation_batch_per_adapter[adapter_name],
+                                pass_data_per_adapter[adapter_name],
                                 forward_kwargs_per_adapter[adapter_name],
-                                other_data, 
+                                other_data,
                                 adapter_name,
-                                current_num_completions
+                                current_num_completions,
+                                main_correct_rate_by_prompt=main_correct_rate_by_prompt,
                             )
-                            
-                            if self.correctness_gated is True:
-                                correctness_rewards = generation_batch_per_adapter[adapter_name]["correctness_reward_per_sample"]
-                                mask = correctness_rewards < self.correctness_threshold
+
+                            if self.correctness_gated is True and self.args.diversity_reward_type not in self._MAIN_WEAK_CORRECTNESS_REWARD_TYPES:
+                                # Gate on PURE answer correctness only -- never the mixed
+                                # correctness_reward scalar (0.0/0.5/1.0/1.5), which would
+                                # let a wrong-but-think-tagged sample (reward 0.5) slip
+                                # through an 0.5 threshold ungated.
+                                #
+                                # main_weak_correctness_bonus is deliberately EXCLUDED from
+                                # this gate: its diversity_advantages already come from
+                                # Norm[answer_correct_float] (see _score_completions_diversity),
+                                # where a correct sample gets positive advantage and a wrong
+                                # sample gets NEGATIVE advantage by design -- that contrast is
+                                # the intended training signal. Zeroing wrong samples here
+                                # would remove the negative half of the contrast and weaken
+                                # the signal, so this reward type manages its own
+                                # correctness-based shaping internally instead.
+                                answer_correct_float = generation_batch_per_adapter[adapter_name]["answer_correct_float"]
+                                mask = answer_correct_float < self.correctness_threshold
                                 generation_batch_per_adapter[adapter_name]["diversity_advantages"][mask] = 0.0
 
                             # no_correctness 모드: diversity만으로 학습
@@ -3166,11 +3250,30 @@ class CoExTrainer(BaseTrainer):
                 with open(save_path, "w") as f:
                     json.dump(save_data, f, indent=4, ensure_ascii=False)
 
+                # Keys added by _annotate_and_verify_update_semantics that are plain
+                # Python scalars (str / bool). Both shuffle_sequence_dict and
+                # split_tensor_dict only understand tensors and lists, so we must
+                # pop these keys out before calling either utility and restore them
+                # afterwards.
+                _SCALAR_META_KEYS = (
+                    "expected_update_scope",
+                    "update_scope",
+                    "advantage_source",
+                    "advantage_source_verified",
+                )
+
                 for adapter_name in self.all_adapter_names:
                     generation_batch_per_adapter[adapter_name] = split_pixel_values_by_grid(generation_batch_per_adapter[adapter_name])
                     if self.loss_type not in {"dmpo", "pure_dmpo"}:
                         generation_batch_per_adapter[adapter_name] = shuffle_sequence_dict(generation_batch_per_adapter[adapter_name])
                     
+                    batch = split_pixel_values_by_grid(generation_batch_per_adapter[adapter_name])
+                    saved_meta = {k: batch.pop(k) for k in _SCALAR_META_KEYS if k in batch}
+                    if self.loss_type not in {"dmpo", "pure_dmpo"}:
+                        batch = shuffle_sequence_dict(batch)
+                    batch.update(saved_meta)
+                    generation_batch_per_adapter[adapter_name] = batch
+
                 # generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
                 # self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
 
@@ -3178,7 +3281,10 @@ class CoExTrainer(BaseTrainer):
                 for adapter_name in self.all_adapter_names:
                     adapter_batch = generation_batch_per_adapter[adapter_name]
                     # 각 adapter의 배치를 steps_per_generation 개로 split
+                    saved_meta = {k: adapter_batch.pop(k) for k in _SCALAR_META_KEYS if k in adapter_batch}
                     split_batches = split_tensor_dict(adapter_batch, self.args.steps_per_generation)
+                    for split_batch in split_batches:
+                        split_batch.update(saved_meta)
                     split_batches = [unsplit_pixel_values_by_grid(batch) for batch in split_batches]
                     buffered_per_adapter[adapter_name] = split_batches
                 self._buffered_inputs = []
@@ -4595,6 +4701,51 @@ class CoExTrainer(BaseTrainer):
                             
         return output_per_adapter, pass_data_per_adapter, forward_kwargs_per_adapter
 
+    def _log_main_correct_rate_and_group_coverage(
+        self,
+        full_source_trace_metadata: list[Any] | None,
+        main_correct_rate_by_prompt: dict[int, float],
+    ) -> None:
+        """Logs main_correct_rate(x) distribution and whole-group coverage stats.
+
+        `full_source_trace_metadata` must be the UNSLICED per-step metadata
+        list (i.e. `generation_batch_per_adapter["default"]["source_trace_metadata"]`),
+        which covers every row generated this step across every adapter --
+        default's own correctness pass always scores the full pool, so by the
+        time this is called every row already has `answer_correct_float`,
+        `prompt_index`, and `source_adapter_name` populated.
+        """
+        mode = "train" if self.model.training else "eval"
+        if mode != "train":
+            return
+
+        rates = list(main_correct_rate_by_prompt.values())
+        if rates:
+            n = len(rates)
+            self._metrics[mode]["train/main_correct_rate/mean"].append(sum(rates) / n)
+            mean = sum(rates) / n
+            variance = sum((r - mean) ** 2 for r in rates) / n
+            self._metrics[mode]["train/main_correct_rate/std"].append(variance ** 0.5)
+
+            # N_m (main rollouts per prompt) is fixed for the whole run, so the
+            # possible rates are always k / N_m for k in [0, N_m]. We bucket at
+            # the canonical (4/3/3)-style quarters for readability, but this is
+            # purely descriptive -- rates outside these buckets are ignored by
+            # a given frac_* bucket, not dropped from mean/std above.
+            def frac_close(target: float) -> float:
+                return sum(1 for r in rates if abs(r - target) < 1e-6) / n
+
+            self._metrics[mode]["train/main_correct_rate/frac_0"].append(frac_close(0.0))
+            self._metrics[mode]["train/main_correct_rate/frac_025"].append(frac_close(0.25))
+            self._metrics[mode]["train/main_correct_rate/frac_05"].append(frac_close(0.5))
+            self._metrics[mode]["train/main_correct_rate/frac_075"].append(frac_close(0.75))
+            self._metrics[mode]["train/main_correct_rate/frac_1"].append(frac_close(1.0))
+
+        if full_source_trace_metadata is not None:
+            coverage = compute_group_coverage_stats(full_source_trace_metadata)
+            for key, value in coverage.items():
+                self._metrics[mode][f"train/group/{key}"].append(value)
+
     @profiling_decorator
     def _score_completions_correctness(
         self, generation_batch: dict[str, torch.Tensor | Any], pass_data, pass_forward_kwargs, adapter_name: str, num_completions: int, adapter_index: list[int]
@@ -4794,6 +4945,23 @@ class CoExTrainer(BaseTrainer):
         else:
             local_answer_info = [None] * len(prompts)
 
+        # Pure answer correctness c(x,y) in {0,1}, independent of think/format
+        # bonuses -- this is the ONLY field that should ever be used for
+        # correctness gating or for verifier-observable correctness rewards
+        # such as main_weak_correctness_bonus. Never threshold `local_rewards`
+        # (the mixed correctness_reward scalar) for that purpose.
+        answer_correct_float = torch.tensor(
+            [
+                float(info.get("answer_correct_float", 0.0)) if isinstance(info, dict) else 0.0
+                for info in local_answer_info
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        if mode == "train":
+            own_correct = answer_correct_float[adapter_index] if adapter_name == "default" else answer_correct_float
+            self._metrics[mode][f"train/source/{adapter_name}/answer_correct_mean"].append(own_correct.mean().item())
+
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
@@ -4863,11 +5031,15 @@ class CoExTrainer(BaseTrainer):
         if source_trace_metadata is not None:
             corr_values = local_rewards.detach().float().cpu().tolist()
             corr_adv_values = advantages.detach().float().cpu().tolist()
+            correct_values = answer_correct_float.detach().float().cpu().tolist()
             for idx, record in enumerate(source_trace_metadata):
                 if isinstance(record, dict):
                     record["correctness_reward"] = corr_values[idx] if idx < len(corr_values) else None
                     record["correctness_advantage"] = corr_adv_values[idx] if idx < len(corr_adv_values) else None
-
+                    is_correct = bool(correct_values[idx] >= 1.0) if idx < len(correct_values) else None
+                    record["is_correct"] = is_correct
+                    record["answer_correct"] = is_correct
+                    record["answer_correct_float"] = correct_values[idx] if idx < len(correct_values) else None
         if self.use_vllm and use_importance_weighting and importance_sampling_ratio is not None:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
             delta = delta[completion_mask.bool()]
@@ -4906,6 +5078,7 @@ class CoExTrainer(BaseTrainer):
             "correctness_reward_per_sample": local_rewards,
             "raw_rewards": local_rewards,
             "answer_info": local_answer_info,
+            "answer_correct_float": answer_correct_float,
             "source_trace_metadata": source_trace_metadata,
         }
         if old_per_token_logps is not None:
@@ -4934,10 +5107,17 @@ class CoExTrainer(BaseTrainer):
         self,
         generation_batch: dict[str, torch.Tensor | Any],
         pass_data, pass_forward_kwargs, other_data,
-        adapter_name: str, num_completions: int
+        adapter_name: str, num_completions: int,
+        main_correct_rate_by_prompt: dict[int, float] | None = None,
     ) -> dict[str, torch.Tensor | Any]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+
+        if adapter_name == "default":
+            raise ValueError(
+                "_score_completions_diversity must never be called for the default/main "
+                "adapter -- it remains a collective correctness learner only."
+            )
 
         inputs = pass_data["inputs"]
         prompts = pass_data["prompts"]
@@ -4962,9 +5142,12 @@ class CoExTrainer(BaseTrainer):
                 num_images=pass_data["num_images"],
             )
 
-            # 2) optional correctness gate (FIX: corr 정의)
+            # 2) optional correctness gate -- gate on PURE answer correctness
+            # only, never the mixed correctness_reward_per_sample scalar
+            # (0.0/0.5/1.0/1.5), which would let a wrong-but-think-tagged
+            # sample slip past a threshold like 0.5.
             gate = None
-            corr = generation_batch.get("correctness_reward_per_sample", None)
+            corr = generation_batch.get("answer_correct_float", None)
             if getattr(self.args, "policy_repulsion_gate_by_correctness", False) and corr is not None:
                 thr = float(getattr(self.args, "policy_repulsion_gate_threshold", 1.0))
                 gate = (corr >= thr).float()
@@ -5028,6 +5211,143 @@ class CoExTrainer(BaseTrainer):
             trace_diagnostics["reward"] = rewards_per_func[:, 0]
 
         elif reward_type == "external" or reward_type in self._ONE_MINUS_BLEU_REWARD_TYPES:
+            bleu_balance_mode = getattr(self.args, "diversity_bleu_balance_mode", "sample_balanced")
+            bleu_main_weight = float(getattr(self.args, "diversity_source_main_weight", 0.5))
+            bleu_exclude_self = bool(getattr(self.args, "diversity_bleu_exclude_self", True))
+            bleu_text_scope = getattr(self.args, "diversity_bleu_text_scope", "full_completion")
+
+            reference_groups = other_data.get("reference_groups", {})
+            source_group_name = other_data.get("source_group_name", None)
+
+            local_reward_values, bleu_diag = compute_one_minus_bleu_rewards_for_adapter(
+                source_completions=completions,
+                reference_groups=reference_groups,
+                balance_mode=bleu_balance_mode,
+                main_weight=bleu_main_weight,
+                exclude_self=bleu_exclude_self,
+                text_scope=bleu_text_scope,
+                source_group_name=source_group_name,
+            )
+            local_rewards = torch.tensor(local_reward_values, dtype=torch.float32, device=device)
+            local_rewards = torch.nan_to_num(local_rewards, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+            rewards_per_func = gather(local_rewards).unsqueeze(1)
+            diversity_reward_names = [reward_type]
+            diversity_weights = torch.ones(1, device=device)
+
+            # Debug logging for BLEU reward diagnostics
+            if getattr(self.args, "diversity_reward_debug", False):
+                debug_interval = int(getattr(self.args, "diversity_reward_debug_steps", 20))
+                if self._step % debug_interval == 0:
+                    ref_sizes = bleu_diag.get("reference_group_sizes", {})
+                    n_ref_default = ref_sizes.get("default", 0)
+                    n_ref_other_div = sum(v for k, v in ref_sizes.items() if k != "default")
+                    n_ref_total = sum(ref_sizes.values())
+                    sim_main = [v for v in bleu_diag["sim_main_mean"] if not math.isnan(v)]
+                    sim_other = [v for v in bleu_diag["sim_other_div_mean"] if not math.isnan(v)]
+                    gathered_rewards = rewards_per_func[:, 0]
+                    logger.info(
+                        f"[DiversityBLEU] adapter={adapter_name} step={self._step} "
+                        f"balance_mode={bleu_balance_mode} scope={self.diversity_comparison_scope} "
+                        f"main_weight={bleu_main_weight} "
+                        f"n_src={bleu_diag['num_source']} "
+                        f"n_ref_total={n_ref_total} n_ref_default={n_ref_default} "
+                        f"n_ref_other_div={n_ref_other_div} "
+                        f"sim_main_mean={sum(sim_main)/len(sim_main):.4f}" if sim_main else
+                        f"[DiversityBLEU] adapter={adapter_name} step={self._step} "
+                        f"balance_mode={bleu_balance_mode} scope={self.diversity_comparison_scope} "
+                        f"main_weight={bleu_main_weight} "
+                        f"n_src={bleu_diag['num_source']} "
+                        f"n_ref_total={n_ref_total} n_ref_default={n_ref_default} "
+                        f"n_ref_other_div={n_ref_other_div} "
+                        f"reward_mean={gathered_rewards.mean().item():.4f} "
+                        f"reward_std={gathered_rewards.std(unbiased=False).item():.4f} "
+                        f"reward_min={gathered_rewards.min().item():.4f} "
+                        f"reward_max={gathered_rewards.max().item():.4f}"
+                    )
+                    self._metrics[mode][f"{adapter_name}/bleu_diversity/n_ref_total"].append(float(n_ref_total))
+                    self._metrics[mode][f"{adapter_name}/bleu_diversity/n_ref_default"].append(float(n_ref_default))
+                    self._metrics[mode][f"{adapter_name}/bleu_diversity/n_ref_other_div"].append(float(n_ref_other_div))
+                    if sim_main:
+                        self._metrics[mode][f"{adapter_name}/bleu_diversity/sim_main_mean"].append(
+                            sum(sim_main) / len(sim_main)
+                        )
+                    if sim_other:
+                        self._metrics[mode][f"{adapter_name}/bleu_diversity/sim_other_div_mean"].append(
+                            sum(sim_other) / len(sim_other)
+                        )
+
+        elif reward_type in self._MAIN_WEAK_CORRECTNESS_REWARD_TYPES:
+            # main_weak_correctness_bonus: reward a diversity sample for being
+            # correct on prompts where the main/default adapter itself is
+            # weak, instead of rewarding arbitrary textual diversity.
+            #
+            # --- Old formula (superseded, kept for reference) -----------------
+            #   raw_bonus = answer_correct_float * (1.0 - main_correct_rate)
+            #   diversity_advantages = normalize(raw_bonus)
+            #
+            # Problem: (1 - main_correct_rate(x)) is a CONSTANT across every
+            # diversity sample from the same prompt x (this branch's group
+            # normalization below is scoped to one adapter's own rollouts for
+            # a single prompt, i.e. exactly the samples that all share the
+            # same main_correct_rate(x)). Group normalization subtracts the
+            # group mean and divides by the group std, both of which scale
+            # linearly with any shared per-group constant k > 0:
+            #   Norm[k * v] == Norm[v]  for a per-group constant k.
+            # So "main is weaker on this prompt" barely changed the resulting
+            # advantage relative to a prompt where main was already strong --
+            # the intended "reward main-weak coverage more" signal was mostly
+            # cancelled by normalization.
+            #
+            # --- New formula -----------------------------------------------
+            #   aux_correct_advantages = Norm[c(x, y)]                       (below, shared normalization block)
+            #   main_weak_advantages   = (1 - main_correct_rate(x)) * aux_correct_advantages   (post-normalization hook, below)
+            #   main_weak_advantages   = main_weak_correctness_bonus_weight * main_weak_advantages
+            # The main-weakness factor is applied to the ALREADY-NORMALIZED
+            # advantage, so it is not cancelled by the group std division.
+            #
+            # c(x, y) is PURE answer correctness (answer_correct_float, never
+            # the mixed correctness_reward scalar). main_correct_rate(x) was
+            # computed once per step from the default adapter's own rollouts,
+            # before any diversity adapter was scored, and is passed in here
+            # already aligned per prompt_index.
+            local_answer_correct = generation_batch.get("answer_correct_float")
+            if local_answer_correct is None:
+                raise ValueError(
+                    "main_weak_correctness_bonus requires 'answer_correct_float' in "
+                    "generation_batch -- _score_completions_correctness must run for "
+                    "this adapter before _score_completions_diversity."
+                )
+            local_source_metadata = generation_batch.get("source_trace_metadata") or [None] * len(
+                local_answer_correct
+            )
+            aligned_main_rate = align_main_correct_rate_to_local_rows(
+                local_source_metadata,
+                main_correct_rate_by_prompt or {},
+            )
+            # Raw diagnostic value ONLY -- c(x,y)*(1-main_correct_rate(x)).
+            # This is never fed into rewards_per_func/normalization anymore;
+            # it is recorded purely for logging/metadata (see below).
+            raw_bonus_values = compute_main_weak_correctness_bonus(
+                local_answer_correct.detach().float().cpu().tolist(),
+                aligned_main_rate,
+            )
+            local_raw_bonus = torch.tensor(raw_bonus_values, dtype=torch.float32, device=device)
+
+            # rewards_per_func carries PURE answer correctness -- the shared
+            # normalization block below (identical code path every other
+            # diversity reward uses, scoped to this adapter's own rollouts)
+            # computes aux_correct_advantages = Norm[c(x, y)] from this.
+            local_rewards = local_answer_correct.detach().float()
+            rewards_per_func = gather(local_rewards).unsqueeze(1)
+            diversity_reward_names = [reward_type]
+            diversity_weights = torch.ones(1, device=device)
+            gathered_main_rate = gather(
+                torch.tensor(aligned_main_rate, dtype=torch.float32, device=device)
+            )
+            gathered_raw_bonus = gather(local_raw_bonus)
+
+        elif reward_type == "external":
+            # Legacy external reward path (e.g. custom reward_funcs_diversity registered at init).
             rewards_per_func = self._calculate_diversity_rewards(
                 inputs,
                 prompts,
@@ -5065,6 +5385,25 @@ class CoExTrainer(BaseTrainer):
         advantages = torch.nan_to_num(
             advantages, nan=0.0, posinf=0.0, neginf=0.0
         )
+        
+        aux_correct_advantages_global = None
+        if reward_type in self._MAIN_WEAK_CORRECTNESS_REWARD_TYPES:
+            # At this point `advantages` == aux_correct_advantages == Norm[c(x,y)],
+            # computed by the shared group-normalization above (rewards_per_func
+            # held pure answer correctness for this branch). Snapshot it before
+            # applying the main-weakness factor, for diagnostics/metadata below.
+            aux_correct_advantages_global = advantages.clone()
+
+            # Apply (1 - main_correct_rate(x)) and main_weak_correctness_bonus_weight
+            # AFTER group normalization, not to the raw reward -- see the long
+            # comment above this branch's rewards_per_func construction for why
+            # a pre-normalization multiply would be cancelled by the group std
+            # division. Applying both factors here, to the already-normalized
+            # advantage, makes them effective, non-cancelled knobs.
+            main_weak_factor_global = 1.0 - gathered_main_rate
+            advantages = main_weak_factor_global * advantages
+            main_weak_weight = float(getattr(self.args, "main_weak_correctness_bonus_weight", 1.0))
+            advantages = main_weak_weight * advantages
 
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
@@ -5073,6 +5412,9 @@ class CoExTrainer(BaseTrainer):
         all_process_advantages = advantages.clone()
         advantages = advantages[process_slice]
         local_rewards = rewards[process_slice]
+        local_aux_correct_advantages = (
+            aux_correct_advantages_global[process_slice] if aux_correct_advantages_global is not None else None
+        )
 
         # metrics/logs
         for i, name in enumerate(diversity_reward_names):
@@ -5115,15 +5457,114 @@ class CoExTrainer(BaseTrainer):
         for i, name in enumerate(diversity_reward_names):
             self._logs[f"{adapter_name}/diversity_rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs[f"{adapter_name}/diversity_advantages"].extend(all_process_advantages.tolist())
+        is_main_weak = reward_type in self._MAIN_WEAK_CORRECTNESS_REWARD_TYPES
 
         source_trace_metadata = generation_batch.get("source_trace_metadata", None)
         if source_trace_metadata is not None:
             div_values = local_rewards.detach().float().cpu().tolist()
             div_adv_values = advantages.detach().float().cpu().tolist()
+            if is_main_weak:
+                local_raw_bonus_values = local_raw_bonus.detach().float().cpu().tolist()
+                local_aux_correct_values = (
+                    local_aux_correct_advantages.detach().float().cpu().tolist()
+                    if local_aux_correct_advantages is not None
+                    else [None] * len(source_trace_metadata)
+                )
             for idx, record in enumerate(source_trace_metadata):
                 if isinstance(record, dict):
                     record["diversity_reward"] = div_values[idx] if idx < len(div_values) else None
                     record["diversity_advantage"] = div_adv_values[idx] if idx < len(div_adv_values) else None
+                    if is_main_weak:
+                        main_rate = aligned_main_rate[idx] if idx < len(aligned_main_rate) else None
+                        record["main_correct_rate"] = main_rate
+                        record["main_weak_factor"] = (1.0 - main_rate) if main_rate is not None else None
+                        # Raw diagnostic ONLY: c(x,y)*(1-main_correct_rate(x)).
+                        # This is NOT what feeds the loss -- see
+                        # main_weak_correctness_advantage below for that.
+                        record["main_weak_correctness_bonus"] = (
+                            local_raw_bonus_values[idx] if idx < len(local_raw_bonus_values) else None
+                        )
+                        # aux_correct_advantage = Norm[c(x,y)], BEFORE the
+                        # main-weakness factor and weight are applied.
+                        record["aux_correct_advantage"] = (
+                            local_aux_correct_values[idx] if idx < len(local_aux_correct_values) else None
+                        )
+                        # The value actually used in the loss -- numerically
+                        # identical to diversity_advantage above for this
+                        # reward type, re-exposed under a formula-matching
+                        # name for easier diagnostics.
+                        record["main_weak_correctness_advantage"] = (
+                            div_adv_values[idx] if idx < len(div_adv_values) else None
+                        )
+
+        if is_main_weak and bool(getattr(self.args, "main_weak_correctness_bonus_log_by_source", True)):
+            raw_bonus_g = torch.nan_to_num(gathered_raw_bonus)
+            raw_mean = raw_bonus_g.mean().item()
+            raw_std = raw_bonus_g.std(unbiased=False).item()
+            raw_nonzero_frac = (raw_bonus_g > 0.0).float().mean().item()
+            raw_sum = raw_bonus_g.sum().item()
+
+            # Raw diagnostic (c(x,y)*(1-main_correct_rate(x))) -- kept under
+            # the original key names for backward compatibility, plus
+            # explicit raw_* aliases making clear this is diagnostic only,
+            # NOT the training signal (see adv_* below for that).
+            self._metrics[mode]["train/main_weak_correctness_bonus/mean"].append(raw_mean)
+            self._metrics[mode]["train/main_weak_correctness_bonus/std"].append(raw_std)
+            self._metrics[mode]["train/main_weak_correctness_bonus/nonzero_frac"].append(raw_nonzero_frac)
+            self._metrics[mode]["train/main_weak_correctness_bonus/raw_sum"].append(raw_sum)
+            self._metrics[mode]["train/main_weak_correctness_bonus/raw_mean"].append(raw_mean)
+            self._metrics[mode]["train/main_weak_correctness_bonus/raw_std"].append(raw_std)
+            self._metrics[mode]["train/main_weak_correctness_bonus/raw_nonzero_frac"].append(raw_nonzero_frac)
+
+            # weighted_sum: kept for backward compatibility, but this is a
+            # group-NORMALIZED advantage, so its sum sits near 0 by
+            # construction regardless of signal strength -- use adv_abs_mean
+            # / adv_l2 below to actually gauge signal strength.
+            self._metrics[mode]["train/main_weak_correctness_bonus/weighted_sum"].append(
+                all_process_advantages.sum().item()
+            )
+
+            adv_g = torch.nan_to_num(all_process_advantages)
+            adv_abs_g = adv_g.abs()
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_mean"].append(adv_g.mean().item())
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_std"].append(
+                adv_g.std(unbiased=False).item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_abs_mean"].append(adv_abs_g.mean().item())
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_abs_sum"].append(adv_abs_g.sum().item())
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_l2"].append(
+                torch.sqrt((adv_g ** 2).mean()).item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_nonzero_frac"].append(
+                (adv_abs_g > 0.0).float().mean().item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_positive_frac"].append(
+                (adv_g > 0.0).float().mean().item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_negative_frac"].append(
+                (adv_g < 0.0).float().mean().item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_positive_mass"].append(
+                adv_g.clamp(min=0.0).sum().item()
+            )
+            self._metrics[mode]["train/main_weak_correctness_bonus/adv_negative_mass"].append(
+                adv_g.clamp(max=0.0).sum().item()
+            )
+
+            # Source-level (per diversity adapter). raw_* reuse the
+            # process-gathered-but-adapter-scoped raw bonus; adv_* use this
+            # adapter's own already-sliced local advantage.
+            local_adv = torch.nan_to_num(advantages)
+            self._metrics[mode][f"train/source/{adapter_name}/main_weak_bonus_mean"].append(raw_mean)
+            self._metrics[mode][f"train/source/{adapter_name}/main_weak_bonus_nonzero_frac"].append(
+                raw_nonzero_frac
+            )
+            self._metrics[mode][f"train/source/{adapter_name}/main_weak_adv_abs_mean"].append(
+                local_adv.abs().mean().item()
+            )
+            self._metrics[mode][f"train/source/{adapter_name}/main_weak_adv_std"].append(
+                local_adv.std(unbiased=False).item()
+            )
 
         generation_batch["diversity_reward_per_sample"] = local_rewards
         generation_batch["diversity_advantages"] = advantages

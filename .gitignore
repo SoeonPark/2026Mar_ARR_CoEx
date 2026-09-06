@@ -2,3 +2,16 @@ wandb/
 __pycache__/
 trainer_output/
 completion_storage/
+log/
+diagnostics/
+eval_log/
+eval_results/
+merged_output/
+.claude/
+.pytest_cache/
+lm-evaluation-harness/
+*.orig
+*.bak.*
+*.patch
+tests/
+*.log

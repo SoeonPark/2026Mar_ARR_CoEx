@@ -19,9 +19,11 @@ batch_size: auto
 system_instruction: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{}. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
 
 gen_kwargs:
+  do_sample: true
   temperature: 0.6
   top_p: 0.95
-  max_gen_toks: 32768
+  # 32768-token context에서 prompt/system instruction용 2048 tokens를 보존한다.
+  max_gen_toks: 30720
 
 log_samples: true
 

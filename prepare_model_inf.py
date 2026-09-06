@@ -217,9 +217,20 @@ def main():
     if os.path.exists(src):
         shutil.copy(src, os.path.join(args.out_dir, "chat_template.jinja"))
     # trust_remote_code 모델용 .py 파일 복사 (Phi-4-mini 등)
+    # base_model_path가 HuggingFace 모델 ID인 경우 캐시 경로를 찾아야 함
     import glob
-    for py_file in glob.glob(os.path.join(args.base_model_path, "*.py")):
-        shutil.copy(py_file, args.out_dir)
+    base_model_local = args.base_model_path
+    if not os.path.isdir(args.base_model_path):
+        try:
+            from huggingface_hub import snapshot_download
+            base_model_local = snapshot_download(args.base_model_path, local_files_only=True)
+        except Exception as e:
+            print(f"[WARN] Could not resolve HuggingFace cache path for .py files: {e}")
+            base_model_local = None
+    if base_model_local:
+        for py_file in glob.glob(os.path.join(base_model_local, "*.py")):
+            shutil.copy(py_file, args.out_dir)
+            print(f"[SAVE] copied {os.path.basename(py_file)} -> {args.out_dir}")
     print("[SAVE] merged saved to:", args.out_dir)
 
     # cleanup
